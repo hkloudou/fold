@@ -26,6 +26,7 @@ type DB struct {
 	dir     string             // data root directory
 	tables  map[string]*Schema // registered table schemas
 	compact CompactOptions     // merge/upsert worker and DuckDB execution tuning
+	bloomMu sync.Mutex         // serializes whole-file bloom rewrites across concurrent workers
 	mu      sync.RWMutex
 }
 

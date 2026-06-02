@@ -306,6 +306,11 @@ func (t *Table[T]) maybeAddBloom(path string) error {
 		log.Printf("[Fold] %s: skipping bloom rewrite for %d-byte output (limit %d)", t.schema.Name, info.Size(), opts.BloomMaxFileBytes)
 		return nil
 	}
+	// Serialize the whole-file rewrite so concurrent partition workers don't load
+	// several files into memory at once. Combined with the per-file size cap
+	// above, peak bloom-rewrite memory stays near a single file.
+	t.db.bloomMu.Lock()
+	defer t.db.bloomMu.Unlock()
 	return addBloomFilters(path, t.schema)
 }
 

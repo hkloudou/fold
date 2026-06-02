@@ -1373,3 +1373,45 @@ func TestBloomRewriteSkippedForLargeOutput(t *testing.T) {
 		t.Fatalf("data wrong after skipping bloom: total=%d, want 3", got)
 	}
 }
+
+// TestBloomRewriteAcrossManyPartitions exercises the serialized bloom rewrite
+// under concurrent partition workers: every published partition file must carry
+// the bloom filter, and no data is lost.
+func TestBloomRewriteAcrossManyPartitions(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[PartitionedRow](db)
+
+	rows := make([]PartitionedRow, 0, 12)
+	for i := 0; i < 12; i++ {
+		rows = append(rows, PartitionedRow{ID: fmt.Sprintf("id%02d", i), Name: "n", Region: "r", UpdatedAt: int64(i)})
+	}
+	if err := table.Import("s", rows); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	files := listParquetFiles(table.mainDir())
+	if len(files) < 2 {
+		t.Fatalf("expected multiple partition files, got %d", len(files))
+	}
+	if n := bloomFilterColumns(t, table.mainDir(), "id"); n != len(files) {
+		t.Fatalf("bloom filter present on %d of %d partition files", n, len(files))
+	}
+
+	queryDB := openQueryDB(t)
+	defer queryDB.Close()
+	glob := filepath.Join(table.mainDir(), "**", "*.parquet")
+	var count int
+	if err := queryDB.QueryRow(fmt.Sprintf(`SELECT count(*) FROM read_parquet('%s', union_by_name=true)`, glob)).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 12 {
+		t.Fatalf("row count = %d, want 12", count)
+	}
+}
