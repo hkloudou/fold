@@ -168,24 +168,40 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 		}
 	}
 
-	// Delete old main files.
-	for _, f := range mainPartFiles {
-		os.Remove(f)
-	}
-
-	// Write the result.
+	// Publish crash-safely: write the merged result to a staging file, validate
+	// it, then rename it into place. Existing main files are never removed before
+	// the replacement is durably written, so a crash cannot leave the partition
+	// without data. (Retry idempotency after a successful publish is #4.)
 	ts := time.Now().UnixMilli()
-	outFile := filepath.Join(mainPartDir, fmt.Sprintf("merged_%d.parquet", ts))
-	if _, err := db.Exec(fmt.Sprintf(`COPY result TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3)`, outFile)); err != nil {
+	tmpFile := filepath.Join(mainPartDir, fmt.Sprintf(".merged_%d.parquet.tmp", ts))
+	finalFile := filepath.Join(mainPartDir, fmt.Sprintf("merged_%d.parquet", ts))
+
+	if _, err := db.Exec(fmt.Sprintf(`COPY result TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3)`, tmpFile)); err != nil {
+		os.Remove(tmpFile)
 		return fmt.Errorf("write result: %w", err)
 	}
 
-	// Add bloom filters for bloom-enabled columns.
-	if err := addBloomFilters(outFile, schema); err != nil {
+	if err := validateStagedParquet(db, tmpFile); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("validate staged output: %w", err)
+	}
+
+	if err := os.Rename(tmpFile, finalFile); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("publish result: %w", err)
+	}
+
+	// Add bloom filters for bloom-enabled columns (rewrites finalFile in place).
+	if err := addBloomFilters(finalFile, schema); err != nil {
 		return fmt.Errorf("add bloom filters: %w", err)
 	}
 
-	// Delete inc files.
+	// The replacement is now active; remove superseded main files, then inc.
+	for _, f := range mainPartFiles {
+		if f != finalFile {
+			os.Remove(f)
+		}
+	}
 	for _, f := range incPartFiles {
 		os.Remove(f)
 	}
@@ -246,6 +262,11 @@ func (t *Table[T]) mergeFull(incFiles, mainFiles []string) error {
 		return fmt.Errorf("write result: %w", err)
 	}
 
+	if err := validateStagedParquet(db, tmpFile); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("validate staged output: %w", err)
+	}
+
 	if err := os.Rename(tmpFile, finalFile); err != nil {
 		os.Remove(tmpFile)
 		return err
@@ -267,6 +288,23 @@ func (t *Table[T]) mergeFull(incFiles, mainFiles []string) error {
 	}
 
 	log.Printf("[Fold] %s: merge complete", schema.Name)
+	return nil
+}
+
+// validateStagedParquet checks that a freshly written parquet file reads back
+// with the same row count as the result table, catching a truncated or corrupt
+// write before it is published over active data.
+func validateStagedParquet(db *sql.DB, path string) error {
+	var resultRows, fileRows int64
+	if err := db.QueryRow(`SELECT count(*) FROM result`).Scan(&resultRows); err != nil {
+		return fmt.Errorf("count result: %w", err)
+	}
+	if err := db.QueryRow(fmt.Sprintf(`SELECT count(*) FROM read_parquet('%s')`, path)).Scan(&fileRows); err != nil {
+		return fmt.Errorf("count staged file: %w", err)
+	}
+	if resultRows != fileRows {
+		return fmt.Errorf("row count mismatch: result has %d rows, staged file has %d", resultRows, fileRows)
+	}
 	return nil
 }
 
