@@ -113,7 +113,7 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 
 	// Complete any cleanup an interrupted publish skipped (delete already-consumed
 	// inc, remove superseded/orphaned files) before reading the partition.
-	if err := recoverPartition(mainPartDir); err != nil {
+	if err := recoverPartition(t.db.storage, mainPartDir); err != nil {
 		return err
 	}
 
@@ -134,7 +134,7 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 
 	// Active main files come from the manifest, so files left behind by an
 	// interrupted publish are ignored rather than read twice.
-	mainPartFiles, err := activeMainFiles(mainPartDir)
+	mainPartFiles, err := activeMainFiles(t.db.storage, mainPartDir)
 	if err != nil {
 		return err
 	}
@@ -187,7 +187,7 @@ func (t *Table[T]) mergeFull() error {
 	mainDir := t.mainDir()
 
 	// Complete any cleanup an interrupted publish skipped before reading.
-	if err := recoverPartition(mainDir); err != nil {
+	if err := recoverPartition(t.db.storage, mainDir); err != nil {
 		return err
 	}
 
@@ -196,7 +196,7 @@ func (t *Table[T]) mergeFull() error {
 		return nil
 	}
 
-	mainFiles, err := activeMainFiles(mainDir)
+	mainFiles, err := activeMainFiles(t.db.storage, mainDir)
 	if err != nil {
 		return err
 	}
@@ -281,12 +281,12 @@ func (t *Table[T]) publishMerged(db *sql.DB, dir string, consumedInc []string) e
 		return fmt.Errorf("validate staged output: %w", err)
 	}
 
-	if err := os.Rename(tmpFile, finalFile); err != nil {
+	if err := t.db.storage.UploadFile(tmpFile, finalFile); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("publish result: %w", err)
 	}
 
-	return commitActive(dir, []string{finalRel}, consumedInc)
+	return commitActive(t.db.storage, dir, []string{finalRel}, consumedInc)
 }
 
 // maybeAddBloom rewrites the staged file with bloom filters unless they are
