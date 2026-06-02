@@ -978,3 +978,54 @@ func restoreFiles(t *testing.T, files map[string][]byte) {
 		}
 	}
 }
+
+// TestRecoveryErrorsWhenConsumedIncCannotBeRemoved covers the cleanup-failure
+// path: if recovery cannot remove a recorded consumed inc file, a publish must
+// not advance last_commit (which would GC the commit record and later re-apply
+// the surviving inc). The failure is simulated deterministically by recreating
+// the consumed inc path as a non-empty directory, so os.Remove fails with a
+// non-IsNotExist error regardless of process privileges.
+func TestRecoveryErrorsWhenConsumedIncCannotBeRemoved(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+
+	if err := table.Import("b", []MergeRow{{ID: "x", Total: 5}}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	consumed := listParquetFiles(table.incDir())
+	if len(consumed) == 0 {
+		t.Fatal("no inc files captured")
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	before, err := readManifest(table.mainDir())
+	if err != nil || before == nil {
+		t.Fatalf("read manifest: %v (m=%v)", err, before)
+	}
+
+	// Make each recorded consumed inc path un-removable: recreate it as a
+	// non-empty directory so os.Remove returns a non-IsNotExist error.
+	for _, p := range consumed {
+		if err := os.MkdirAll(filepath.Join(p, "blocker"), 0755); err != nil {
+			t.Fatalf("create blocker: %v", err)
+		}
+	}
+
+	if err := table.Upsert("u", []RawRecord{{"id": "x", "total": int64(1)}}); err == nil {
+		t.Fatal("upsert advanced despite un-removable consumed inc; want an error")
+	}
+
+	after, err := readManifest(table.mainDir())
+	if err != nil || after == nil {
+		t.Fatalf("read manifest after: %v (m=%v)", err, after)
+	}
+	if before.LastCommit != after.LastCommit || before.Version != after.Version {
+		t.Fatalf("manifest advanced despite recovery failure: before=%+v after=%+v", before, after)
+	}
+}

@@ -136,7 +136,13 @@ func recoverPartition(dir string) error {
 		return err
 	} else if c != nil {
 		for _, f := range c.InputFiles {
-			os.Remove(f) // leftover consumed inc; ignore if already gone
+			// Removal must succeed before a new publish may advance last_commit.
+			// The commit record is the only record of these consumed inputs; if
+			// it were GC'd while the inc files survived, a later merge would
+			// re-apply them. A file that is already gone is fine.
+			if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("recover consumed inc %s: %w", f, err)
+			}
 		}
 	}
 	active := make([]string, len(m.ActiveFiles))
