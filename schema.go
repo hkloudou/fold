@@ -374,7 +374,11 @@ func (s Strategy) IncAggExpr(field string) string {
 	case StrategyCoalesce:
 		return fmt.Sprintf("COALESCE(MAX(%s), FIRST(%s)) AS %s", field, field, field)
 	case StrategyJSONMerge:
-		return fmt.Sprintf("ANY_VALUE(%s) AS %s", field, field)
+		// Fold every patch for the primary key deterministically (RFC 7396).
+		// Patches are ordered by their text so the result is independent of
+		// row order within the batch; NULLs are skipped. ANY_VALUE would keep
+		// an arbitrary single patch and silently drop the rest.
+		return fmt.Sprintf("CAST(list_reduce(list(CAST(%[1]s AS JSON) ORDER BY %[1]s) FILTER (WHERE %[1]s IS NOT NULL), (a, b) -> json_merge_patch(a, b)) AS VARCHAR) AS %[1]s", field)
 	case StrategyMax:
 		return fmt.Sprintf("MAX(%s) AS %s", field, field)
 	case StrategyMin:

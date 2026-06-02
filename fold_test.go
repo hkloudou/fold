@@ -253,6 +253,84 @@ func TestImportMergeStrategies(t *testing.T) {
 	}
 }
 
+// TestJSONMergeWithinSingleBatch guards against silent patch loss when a single
+// inc batch carries multiple rows for the same primary key with distinct JSON
+// patches. The inc pre-merge must fold every patch deterministically rather than
+// keep an arbitrary one.
+func TestJSONMergeWithinSingleBatch(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+
+	// Three rows, same PK, three non-overlapping patches, plus one conflict on "x".
+	if err := table.Import("batch", []MergeRow{
+		{ID: "a", Meta: `{"x":"1"}`},
+		{ID: "a", Meta: `{"y":"2"}`},
+		{ID: "a", Meta: `{"z":"3"}`},
+		{ID: "a", Meta: `{"x":"9"}`},
+	}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	queryDB := openQueryDB(t)
+	defer queryDB.Close()
+	files := buildFileList(listParquetFiles(table.mainDir()))
+	var meta string
+	if err := queryDB.QueryRow(fmt.Sprintf(
+		`SELECT meta FROM read_parquet([%s], union_by_name=true) WHERE id='a'`, files,
+	)).Scan(&meta); err != nil {
+		t.Fatalf("query row a: %v", err)
+	}
+
+	// Every non-conflicting patch must survive the inc pre-merge.
+	for _, key := range []string{`"y":"2"`, `"z":"3"`} {
+		if !strings.Contains(meta, key) {
+			t.Fatalf("json_merge dropped a patch within one batch: meta=%s missing %s", meta, key)
+		}
+	}
+	// The conflict must resolve deterministically (lexically-last patch wins).
+	if !strings.Contains(meta, `"x":"9"`) {
+		t.Fatalf("json_merge conflict not resolved deterministically: meta=%s", meta)
+	}
+
+	// Re-running the same batch shape must be deterministic across runs.
+	db2, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db2: %v", err)
+	}
+	defer db2.Close()
+	table2 := Register[MergeRow](db2)
+	if err := table2.Import("batch", []MergeRow{
+		{ID: "a", Meta: `{"x":"9"}`},
+		{ID: "a", Meta: `{"z":"3"}`},
+		{ID: "a", Meta: `{"x":"1"}`},
+		{ID: "a", Meta: `{"y":"2"}`},
+	}); err != nil {
+		t.Fatalf("import db2: %v", err)
+	}
+	if err := table2.Merge(); err != nil {
+		t.Fatalf("merge db2: %v", err)
+	}
+	queryDB2 := openQueryDB(t)
+	defer queryDB2.Close()
+	files2 := buildFileList(listParquetFiles(table2.mainDir()))
+	var meta2 string
+	if err := queryDB2.QueryRow(fmt.Sprintf(
+		`SELECT meta FROM read_parquet([%s], union_by_name=true) WHERE id='a'`, files2,
+	)).Scan(&meta2); err != nil {
+		t.Fatalf("query row a (db2): %v", err)
+	}
+	if meta != meta2 {
+		t.Fatalf("json_merge inc aggregation not order-independent: %s vs %s", meta, meta2)
+	}
+}
+
 func TestPartitionedMerge(t *testing.T) {
 	db, err := Open(t.TempDir())
 	if err != nil {
