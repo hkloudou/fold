@@ -118,36 +118,33 @@ func activeMainFiles(dir string) ([]string, error) {
 	return files, nil
 }
 
-// planInc splits the present inc files into those that still need merging and
-// leftovers already consumed by the committed state. Leftovers occur when a
-// crash interrupted inc cleanup after a successful commit; re-merging them would
-// double-apply aggregates such as sum, so they are returned for deletion only.
-func planInc(dir string, incFiles []string) (newInc, consumedLeftovers []string, err error) {
+// recoverPartition completes any cleanup that an interrupted publish skipped: it
+// deletes inc files already consumed by the last commit (so a retry never
+// re-applies them) and removes superseded or orphaned files left in the
+// directory. It is a no-op on a clean directory. Running it before every
+// publish — merge and upsert alike — guarantees that a commit advancing
+// last_commit never strands the previous commit's consumed-inc inputs.
+func recoverPartition(dir string) error {
 	m, err := readManifest(dir)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
-	var consumed map[string]bool
-	if m != nil {
-		c, err := readCommit(dir, m.LastCommit)
-		if err != nil {
-			return nil, nil, err
-		}
-		if c != nil {
-			consumed = make(map[string]bool, len(c.InputFiles))
-			for _, f := range c.InputFiles {
-				consumed[f] = true
-			}
+	if m == nil {
+		return nil
+	}
+	if c, err := readCommit(dir, m.LastCommit); err != nil {
+		return err
+	} else if c != nil {
+		for _, f := range c.InputFiles {
+			os.Remove(f) // leftover consumed inc; ignore if already gone
 		}
 	}
-	for _, f := range incFiles {
-		if consumed[f] {
-			consumedLeftovers = append(consumedLeftovers, f)
-		} else {
-			newInc = append(newInc, f)
-		}
+	active := make([]string, len(m.ActiveFiles))
+	for i, name := range m.ActiveFiles {
+		active[i] = filepath.Join(dir, name)
 	}
-	return newInc, consumedLeftovers, nil
+	finalizeDir(dir, active, m.LastCommit)
+	return nil
 }
 
 // commitActive atomically publishes newActive as the partition's active file

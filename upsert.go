@@ -43,6 +43,12 @@ func (t *Table[T]) upsertFull(rows []map[string]any) error {
 	pkCols := schema.PKColumns()
 	mainDir := t.mainDir()
 
+	// Recover any inc consumed by a prior crashed merge before advancing the
+	// commit record, so its consumed-inc state is never stranded.
+	if err := recoverPartition(mainDir); err != nil {
+		return err
+	}
+
 	// Active main files come from the manifest, consistent with Merge.
 	mainFiles, err := activeMainFiles(mainDir)
 	if err != nil {
@@ -179,6 +185,12 @@ func (t *Table[T]) upsertOnePartition(partDir string, rows []map[string]any) err
 
 	mainPartDir := filepath.Join(t.mainDir(), partDir)
 	os.MkdirAll(mainPartDir, 0755)
+
+	// Recover any inc consumed by a prior crashed merge before advancing the
+	// commit record, so its consumed-inc state is never stranded.
+	if err := recoverPartition(mainPartDir); err != nil {
+		return err
+	}
 
 	mainPartFiles, err := activeMainFiles(mainPartDir)
 	if err != nil {

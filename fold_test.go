@@ -855,3 +855,126 @@ func queryTotal(t *testing.T, dir, id string) int64 {
 	}
 	return total
 }
+
+// TestUpsertPreservesConsumedIncState reproduces the reviewer's scenario: a
+// merge commits but crashes before deleting its inc files, an Upsert runs before
+// the retry, and the retry must not re-apply the crash-surviving inc.
+func TestUpsertPreservesConsumedIncState(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+
+	if err := table.Import("b", []MergeRow{{ID: "x", Total: 5}}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	incBackup := snapshotFiles(t, listParquetFiles(table.incDir()))
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if got := queryTotal(t, table.mainDir(), "x"); got != 5 {
+		t.Fatalf("after merge total = %d, want 5", got)
+	}
+
+	// Simulate the merge crashing before inc cleanup.
+	restoreFiles(t, incBackup)
+
+	if err := table.Upsert("u", []RawRecord{{"id": "x", "total": int64(1)}}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if got := queryTotal(t, table.mainDir(), "x"); got != 6 {
+		t.Fatalf("after upsert total = %d, want 6", got)
+	}
+
+	if err := table.Merge(); err != nil {
+		t.Fatalf("retry merge: %v", err)
+	}
+	if got := queryTotal(t, table.mainDir(), "x"); got != 6 {
+		t.Fatalf("upsert stranded consumed-inc state; retry double-applied: total = %d, want 6", got)
+	}
+}
+
+// TestMergeRecoversInterruptedPublish simulates a merge that committed the
+// manifest but crashed before finalizing the directory: a superseded main file
+// and the consumed inc both survive. The next merge (which sees only the
+// consumed inc) must still finalize — dropping the superseded file and the
+// leftover inc — instead of returning early.
+func TestMergeRecoversInterruptedPublish(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+
+	if err := table.Import("b", []MergeRow{{ID: "x", Total: 4}}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	incBackup := snapshotFiles(t, listParquetFiles(table.incDir()))
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	// Simulate an interrupted finalize: restore the consumed inc and inject a
+	// superseded main file that finalizeDir should have removed.
+	restoreFiles(t, incBackup)
+	m, err := readManifest(table.mainDir())
+	if err != nil || m == nil {
+		t.Fatalf("read manifest: %v (m=%v)", err, m)
+	}
+	data, err := os.ReadFile(filepath.Join(table.mainDir(), m.ActiveFiles[0]))
+	if err != nil {
+		t.Fatalf("read active: %v", err)
+	}
+	stale := filepath.Join(table.mainDir(), "merged_000000.parquet")
+	if err := os.WriteFile(stale, data, 0644); err != nil {
+		t.Fatalf("inject stale: %v", err)
+	}
+
+	if err := table.Merge(); err != nil {
+		t.Fatalf("retry merge: %v", err)
+	}
+
+	if got := queryTotal(t, table.mainDir(), "x"); got != 4 {
+		t.Fatalf("retry double-applied inc: total = %d, want 4", got)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatal("superseded main file was not finalized away on retry")
+	}
+	if files := listParquetFiles(table.mainDir()); len(files) != 1 {
+		t.Fatalf("expected one active main file, got %d: %v", len(files), files)
+	}
+	if files := listParquetFiles(table.incDir()); len(files) != 0 {
+		t.Fatalf("leftover consumed inc not cleaned: %v", files)
+	}
+}
+
+func snapshotFiles(t *testing.T, paths []string) map[string][]byte {
+	t.Helper()
+	out := map[string][]byte{}
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("snapshot %s: %v", p, err)
+		}
+		out[p] = data
+	}
+	if len(out) == 0 {
+		t.Fatal("no files captured for snapshot")
+	}
+	return out
+}
+
+func restoreFiles(t *testing.T, files map[string][]byte) {
+	t.Helper()
+	for p, data := range files {
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			t.Fatalf("restore mkdir %s: %v", p, err)
+		}
+		if err := os.WriteFile(p, data, 0644); err != nil {
+			t.Fatalf("restore %s: %v", p, err)
+		}
+	}
+}

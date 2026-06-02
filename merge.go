@@ -35,7 +35,7 @@ func (t *Table[T]) Merge() error {
 	if len(schema.Partitions) > 0 {
 		return t.mergePartitioned(incFiles)
 	}
-	return t.mergeFull(incFiles)
+	return t.mergeFull()
 }
 
 // mergePartitioned merges partitions concurrently.
@@ -110,7 +110,17 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 	schema := t.schema
 	pkCols := schema.PKColumns()
 
-	// Collect inc files for this partition from all sources.
+	mainPartDir := filepath.Join(t.mainDir(), partDir)
+	os.MkdirAll(mainPartDir, 0755)
+
+	// Complete any cleanup an interrupted publish skipped (delete already-consumed
+	// inc, remove superseded/orphaned files) before reading the partition.
+	if err := recoverPartition(mainPartDir); err != nil {
+		return err
+	}
+
+	// Collect inc files for this partition from all sources; recovery has already
+	// removed any that the last commit consumed.
 	var incPartFiles []string
 	sources, _ := os.ReadDir(t.incDir())
 	for _, src := range sources {
@@ -119,22 +129,6 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 		}
 		srcPartDir := filepath.Join(t.incDir(), src.Name(), partDir)
 		incPartFiles = append(incPartFiles, listParquetFiles(srcPartDir)...)
-	}
-	if len(incPartFiles) == 0 {
-		return nil
-	}
-
-	mainPartDir := filepath.Join(t.mainDir(), partDir)
-	os.MkdirAll(mainPartDir, 0755)
-
-	// Recovery: drop inc files already consumed by the committed state instead
-	// of re-merging them (which would double-apply aggregates such as sum).
-	incPartFiles, leftovers, err := planInc(mainPartDir, incPartFiles)
-	if err != nil {
-		return err
-	}
-	for _, f := range leftovers {
-		os.Remove(f)
 	}
 	if len(incPartFiles) == 0 {
 		return nil
@@ -189,19 +183,17 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 }
 
 // mergeFull merges an unpartitioned table.
-func (t *Table[T]) mergeFull(incFiles []string) error {
+func (t *Table[T]) mergeFull() error {
 	schema := t.schema
 	pkCols := schema.PKColumns()
 	mainDir := t.mainDir()
 
-	// Recovery: drop inc files already consumed by the committed state.
-	incFiles, leftovers, err := planInc(mainDir, incFiles)
-	if err != nil {
+	// Complete any cleanup an interrupted publish skipped before reading.
+	if err := recoverPartition(mainDir); err != nil {
 		return err
 	}
-	for _, f := range leftovers {
-		os.Remove(f)
-	}
+
+	incFiles := listParquetFiles(t.incDir())
 	if len(incFiles) == 0 {
 		return nil
 	}
