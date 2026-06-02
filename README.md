@@ -175,6 +175,17 @@ if err := w.Close(); err != nil { // flushes remaining buffers
 Or stream from an iterator with `table.ImportRows("source", seq, fold.ImportOptions{})`.
 Streaming import only appends to `inc/`; call `Merge` afterwards to compact.
 
+## Storage
+
+Manifest metadata and published files go through a narrow `Storage` interface
+(JSON read/write, file upload/download, list, delete); bulk Parquet is read and
+written by DuckDB in a local workspace. The default is the local filesystem, and
+an adapter can target another backend by staging locally then publishing:
+
+```go
+db, _ := fold.Open("./data", fold.WithStorage(myStorage))
+```
+
 ## Readers
 
 Fold includes lightweight helpers for Excel and JSONL ingestion.

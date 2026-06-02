@@ -2,7 +2,9 @@ package fold
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -723,7 +725,7 @@ func TestMergeWritesManifest(t *testing.T) {
 		t.Fatalf("merge: %v", err)
 	}
 
-	m, err := readManifest(table.mainDir())
+	m, err := readManifest(localStorage{}, table.mainDir())
 	if err != nil {
 		t.Fatalf("read manifest: %v", err)
 	}
@@ -811,7 +813,7 @@ func TestMergeIgnoresStaleMainFile(t *testing.T) {
 	}
 
 	// Inject a stale duplicate of the active main file.
-	m, err := readManifest(table.mainDir())
+	m, err := readManifest(localStorage{}, table.mainDir())
 	if err != nil || m == nil {
 		t.Fatalf("read manifest: %v (m=%v)", err, m)
 	}
@@ -920,7 +922,7 @@ func TestMergeRecoversInterruptedPublish(t *testing.T) {
 	// Simulate an interrupted finalize: restore the consumed inc and inject a
 	// superseded main file that finalizeDir should have removed.
 	restoreFiles(t, incBackup)
-	m, err := readManifest(table.mainDir())
+	m, err := readManifest(localStorage{}, table.mainDir())
 	if err != nil || m == nil {
 		t.Fatalf("read manifest: %v (m=%v)", err, m)
 	}
@@ -1004,7 +1006,7 @@ func TestRecoveryErrorsWhenConsumedIncCannotBeRemoved(t *testing.T) {
 		t.Fatalf("merge: %v", err)
 	}
 
-	before, err := readManifest(table.mainDir())
+	before, err := readManifest(localStorage{}, table.mainDir())
 	if err != nil || before == nil {
 		t.Fatalf("read manifest: %v (m=%v)", err, before)
 	}
@@ -1021,7 +1023,7 @@ func TestRecoveryErrorsWhenConsumedIncCannotBeRemoved(t *testing.T) {
 		t.Fatal("upsert advanced despite un-removable consumed inc; want an error")
 	}
 
-	after, err := readManifest(table.mainDir())
+	after, err := readManifest(localStorage{}, table.mainDir())
 	if err != nil || after == nil {
 		t.Fatalf("read manifest after: %v (m=%v)", err, after)
 	}
@@ -1413,5 +1415,106 @@ func TestBloomRewriteAcrossManyPartitions(t *testing.T) {
 	}
 	if count != 12 {
 		t.Fatalf("row count = %d, want 12", count)
+	}
+}
+
+// countingStorage wraps a Storage and counts calls, to prove the merge path
+// publishes through the Storage seam.
+type countingStorage struct {
+	Storage
+	writeJSON, uploads, lists, deletes int
+}
+
+func (c *countingStorage) WriteJSON(p string, s any, o WriteOptions) error {
+	c.writeJSON++
+	return c.Storage.WriteJSON(p, s, o)
+}
+func (c *countingStorage) UploadFile(l, d string) error {
+	c.uploads++
+	return c.Storage.UploadFile(l, d)
+}
+func (c *countingStorage) List(p string) ([]Object, error) { c.lists++; return c.Storage.List(p) }
+func (c *countingStorage) Delete(p string) error           { c.deletes++; return c.Storage.Delete(p) }
+
+// TestMergeUsesStorage confirms manifest publish + output publish go through the
+// configured Storage, and that a custom backend is honored.
+func TestMergeUsesStorage(t *testing.T) {
+	cs := &countingStorage{Storage: localStorage{}}
+	db, err := Open(t.TempDir(), WithStorage(cs))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+	if err := table.Import("b", []MergeRow{{ID: "x", Total: 1}}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	if cs.writeJSON == 0 {
+		t.Fatal("manifest/commit metadata was not written through Storage")
+	}
+	if cs.uploads == 0 {
+		t.Fatal("merged output was not published through Storage.UploadFile")
+	}
+	if cs.lists == 0 {
+		t.Fatal("recovery/finalize did not list through Storage")
+	}
+	if got := queryTotal(t, table.mainDir(), "x"); got != 1 {
+		t.Fatalf("data wrong through custom storage: total=%d, want 1", got)
+	}
+}
+
+// TestLocalStorageRoundTrip exercises the local filesystem Storage contract.
+func TestLocalStorageRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	var st Storage = localStorage{}
+
+	type doc struct{ N int }
+	jsonPath := filepath.Join(dir, "a.json")
+	if err := st.WriteJSON(jsonPath, doc{N: 5}, WriteOptions{}); err != nil {
+		t.Fatalf("write json: %v", err)
+	}
+	var got doc
+	if err := st.ReadJSON(jsonPath, &got); err != nil {
+		t.Fatalf("read json: %v", err)
+	}
+	if got.N != 5 {
+		t.Fatalf("round-trip N = %d, want 5", got.N)
+	}
+	if err := st.ReadJSON(filepath.Join(dir, "missing.json"), &got); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("missing read err = %v, want fs.ErrNotExist", err)
+	}
+
+	src := filepath.Join(dir, "src.bin")
+	if err := os.WriteFile(src, []byte("hi"), 0644); err != nil {
+		t.Fatalf("seed src: %v", err)
+	}
+	dst := filepath.Join(dir, "sub", "dst.bin")
+	if err := st.UploadFile(src, dst); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if b, err := os.ReadFile(dst); err != nil || string(b) != "hi" {
+		t.Fatalf("upload content = %q (err %v)", b, err)
+	}
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Fatal("UploadFile should move the source")
+	}
+
+	objs, err := st.List(dir)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(objs) == 0 {
+		t.Fatal("list returned nothing")
+	}
+
+	if err := st.Delete(dst); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := st.Delete(dst); err != nil {
+		t.Fatalf("delete of missing object should be nil, got %v", err)
 	}
 }

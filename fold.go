@@ -26,6 +26,7 @@ type DB struct {
 	dir     string             // data root directory
 	tables  map[string]*Schema // registered table schemas
 	compact CompactOptions     // merge/upsert worker and DuckDB execution tuning
+	storage Storage            // metadata + object persistence (default: local filesystem)
 	bloomMu sync.Mutex         // serializes whole-file bloom rewrites across concurrent workers
 	mu      sync.RWMutex
 }
@@ -86,6 +87,13 @@ func WithCompactOptions(o CompactOptions) Option {
 	return func(db *DB) { db.compact = o }
 }
 
+// WithStorage sets the metadata/object persistence backend. The default is the
+// local filesystem; an object-storage adapter can implement Storage to publish
+// manifests and staged outputs elsewhere.
+func WithStorage(s Storage) Option {
+	return func(db *DB) { db.storage = s }
+}
+
 // Open initializes a data root and creates inc/ and main/ subdirectories.
 func Open(dir string, opts ...Option) (*DB, error) {
 	for _, sub := range []string{"inc", "main"} {
@@ -101,6 +109,9 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		opt(db)
 	}
 	db.compact = db.compact.normalized()
+	if db.storage == nil {
+		db.storage = localStorage{}
+	}
 	return db, nil
 }
 

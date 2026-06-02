@@ -45,12 +45,12 @@ func (t *Table[T]) upsertFull(rows []map[string]any) error {
 
 	// Recover any inc consumed by a prior crashed merge before advancing the
 	// commit record, so its consumed-inc state is never stranded.
-	if err := recoverPartition(mainDir); err != nil {
+	if err := recoverPartition(t.db.storage, mainDir); err != nil {
 		return err
 	}
 
 	// Active main files come from the manifest, consistent with Merge.
-	mainFiles, err := activeMainFiles(mainDir)
+	mainFiles, err := activeMainFiles(t.db.storage, mainDir)
 	if err != nil {
 		return err
 	}
@@ -188,11 +188,11 @@ func (t *Table[T]) upsertOnePartition(partDir string, rows []map[string]any) err
 
 	// Recover any inc consumed by a prior crashed merge before advancing the
 	// commit record, so its consumed-inc state is never stranded.
-	if err := recoverPartition(mainPartDir); err != nil {
+	if err := recoverPartition(t.db.storage, mainPartDir); err != nil {
 		return err
 	}
 
-	mainPartFiles, err := activeMainFiles(mainPartDir)
+	mainPartFiles, err := activeMainFiles(t.db.storage, mainPartDir)
 	if err != nil {
 		return err
 	}
