@@ -705,3 +705,153 @@ func TestSnakeCase(t *testing.T) {
 		}
 	}
 }
+
+// TestMergeWritesManifest confirms a merge publishes through the partition
+// manifest rather than relying on directory globs.
+func TestMergeWritesManifest(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+
+	if err := table.Import("b", []MergeRow{{ID: "x", Total: 1}}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	m, err := readManifest(table.mainDir())
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if m == nil {
+		t.Fatal("merge did not write a manifest")
+	}
+	if len(m.ActiveFiles) != 1 || m.LastCommit == "" {
+		t.Fatalf("unexpected manifest: %+v", m)
+	}
+	if _, err := os.Stat(filepath.Join(table.mainDir(), m.ActiveFiles[0])); err != nil {
+		t.Fatalf("active file from manifest is missing: %v", err)
+	}
+}
+
+// TestMergeRetryIdempotent simulates a crash after a successful commit but
+// before the consumed inc files were cleaned up: on the next run those files
+// must be recognized as already applied and dropped, not re-merged (which would
+// double-count the sum aggregate).
+func TestMergeRetryIdempotent(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+
+	if err := table.Import("b", []MergeRow{{ID: "x", Total: 5}}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	// Snapshot the inc files so we can replay them as crash survivors.
+	incBackup := map[string][]byte{}
+	for _, f := range listParquetFiles(table.incDir()) {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read inc: %v", err)
+		}
+		incBackup[f] = data
+	}
+	if len(incBackup) == 0 {
+		t.Fatal("no inc files captured")
+	}
+
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if got := queryTotal(t, table.mainDir(), "x"); got != 5 {
+		t.Fatalf("after first merge total = %d, want 5", got)
+	}
+
+	// Restore the consumed inc files, as if cleanup had been interrupted.
+	for f, data := range incBackup {
+		if err := os.MkdirAll(filepath.Dir(f), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(f, data, 0644); err != nil {
+			t.Fatalf("restore inc: %v", err)
+		}
+	}
+
+	if err := table.Merge(); err != nil {
+		t.Fatalf("retry merge: %v", err)
+	}
+	if got := queryTotal(t, table.mainDir(), "x"); got != 5 {
+		t.Fatalf("retry double-applied the batch: total = %d, want 5", got)
+	}
+}
+
+// TestMergeIgnoresStaleMainFile simulates a publish that crashed before cleaning
+// up an old file: a stale duplicate parquet is left in the partition dir. The
+// next merge must read main via the manifest (ignoring the stale file, so it is
+// not double-counted) and garbage-collect it.
+func TestMergeIgnoresStaleMainFile(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+
+	if err := table.Import("b1", []MergeRow{{ID: "x", Total: 2}}); err != nil {
+		t.Fatalf("import b1: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge b1: %v", err)
+	}
+
+	// Inject a stale duplicate of the active main file.
+	m, err := readManifest(table.mainDir())
+	if err != nil || m == nil {
+		t.Fatalf("read manifest: %v (m=%v)", err, m)
+	}
+	data, err := os.ReadFile(filepath.Join(table.mainDir(), m.ActiveFiles[0]))
+	if err != nil {
+		t.Fatalf("read active: %v", err)
+	}
+	stale := filepath.Join(table.mainDir(), "merged_000000.parquet")
+	if err := os.WriteFile(stale, data, 0644); err != nil {
+		t.Fatalf("write stale: %v", err)
+	}
+
+	if err := table.Import("b2", []MergeRow{{ID: "x", Total: 3}}); err != nil {
+		t.Fatalf("import b2: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge b2: %v", err)
+	}
+
+	if got := queryTotal(t, table.mainDir(), "x"); got != 5 {
+		t.Fatalf("stale main file was double-counted: total = %d, want 5", got)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatal("stale main file was not garbage-collected")
+	}
+	if files := listParquetFiles(table.mainDir()); len(files) != 1 {
+		t.Fatalf("expected exactly one active file, got %d: %v", len(files), files)
+	}
+}
+
+func queryTotal(t *testing.T, dir, id string) int64 {
+	t.Helper()
+	queryDB := openQueryDB(t)
+	defer queryDB.Close()
+	files := buildFileList(listParquetFiles(dir))
+	var total int64
+	if err := queryDB.QueryRow(fmt.Sprintf(
+		`SELECT total FROM read_parquet([%s], union_by_name=true) WHERE id='%s'`, files, id,
+	)).Scan(&total); err != nil {
+		t.Fatalf("query total for %s: %v", id, err)
+	}
+	return total
+}
