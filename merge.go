@@ -15,8 +15,6 @@ import (
 	_ "github.com/marcboeker/go-duckdb/v2"
 )
 
-const mergeWorkers = 10
-
 // Merge performs the CRDT-style merge from inc/ into main/.
 func (t *Table[T]) Merge() error {
 	schema := t.schema
@@ -58,7 +56,7 @@ func (t *Table[T]) mergePartitioned(incFiles []string) error {
 	var wg sync.WaitGroup
 	var mergedCount int64
 
-	workers := mergeWorkers
+	workers := t.db.compact.Workers
 	if workers > len(partDirs) {
 		workers = len(partDirs)
 	}
@@ -141,7 +139,7 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 		return err
 	}
 
-	db, cleanup, err := openDuckDB(mainPartDir)
+	db, cleanup, err := openDuckDB(mainPartDir, t.db.compact.DuckDB)
 	if err != nil {
 		return err
 	}
@@ -205,7 +203,7 @@ func (t *Table[T]) mergeFull() error {
 
 	log.Printf("[Fold] %s: full merge inc=%d main=%d", schema.Name, len(incFiles), len(mainFiles))
 
-	db, cleanup, err := openDuckDB(mainDir)
+	db, cleanup, err := openDuckDB(mainDir, t.db.compact.DuckDB)
 	if err != nil {
 		return err
 	}
@@ -372,14 +370,17 @@ FULL OUTER JOIN main_view t ON %s`,
 
 // --- DuckDB helpers ---
 
-func openDuckDB(dir string) (db *sql.DB, cleanup func(), err error) {
+func openDuckDB(dir string, opts DuckDBOptions) (db *sql.DB, cleanup func(), err error) {
 	dbPath := filepath.Join(dir, fmt.Sprintf(".duckdb_%d.db", time.Now().UnixNano()))
 	db, err = sql.Open("duckdb", dbPath)
 	if err != nil {
 		return nil, nil, err
 	}
-	db.Exec("PRAGMA memory_limit='2GB'")
-	db.Exec("PRAGMA threads=4")
+	db.Exec(fmt.Sprintf("PRAGMA memory_limit='%s'", opts.MemoryLimit))
+	db.Exec(fmt.Sprintf("PRAGMA threads=%d", opts.Threads))
+	if opts.TempDir != "" {
+		db.Exec(fmt.Sprintf("PRAGMA temp_directory='%s'", opts.TempDir))
+	}
 
 	cleanup = func() {
 		db.Close()

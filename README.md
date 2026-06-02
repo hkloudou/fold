@@ -134,6 +134,21 @@ rather than a directory glob, so merges are crash-safe and retry-idempotent.
 `Upsert` is available for small direct updates, but large pipelines should
 prefer append-then-merge flows.
 
+## Tuning
+
+Merge and upsert run DuckDB per partition with conservative defaults. Override
+them at `Open`:
+
+```go
+db, _ := fold.Open("./data", fold.WithCompactOptions(fold.CompactOptions{
+	Workers: 4,
+	DuckDB:  fold.DuckDBOptions{MemoryLimit: "4GB", Threads: 8, TempDir: "/tmp/fold"},
+}))
+```
+
+Unset fields fall back to defaults: 10 workers, `2GB` memory, 4 threads, and no
+explicit temp directory.
+
 ## Readers
 
 Fold includes lightweight helpers for Excel and JSONL ingestion.
