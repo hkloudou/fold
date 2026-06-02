@@ -1147,3 +1147,22 @@ func TestMergeWithCustomDuckDBOptions(t *testing.T) {
 		t.Fatalf("row count = %d, want 2", count)
 	}
 }
+
+// TestMergeRejectsInvalidDuckDBOption verifies a rejected DuckDB option surfaces
+// as an error instead of silently falling back to defaults.
+func TestMergeRejectsInvalidDuckDBOption(t *testing.T) {
+	db, err := Open(t.TempDir(), WithCompactOptions(CompactOptions{
+		DuckDB: DuckDBOptions{MemoryLimit: "not-a-valid-size"},
+	}))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+	if err := table.Import("b", []MergeRow{{ID: "x", Total: 1}}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := table.Merge(); err == nil {
+		t.Fatal("merge should fail when a DuckDB option is invalid, but it succeeded")
+	}
+}

@@ -376,16 +376,27 @@ func openDuckDB(dir string, opts DuckDBOptions) (db *sql.DB, cleanup func(), err
 	if err != nil {
 		return nil, nil, err
 	}
-	db.Exec(fmt.Sprintf("PRAGMA memory_limit='%s'", opts.MemoryLimit))
-	db.Exec(fmt.Sprintf("PRAGMA threads=%d", opts.Threads))
-	if opts.TempDir != "" {
-		db.Exec(fmt.Sprintf("PRAGMA temp_directory='%s'", opts.TempDir))
-	}
-
 	cleanup = func() {
 		db.Close()
 		os.Remove(dbPath)
 		os.Remove(dbPath + ".wal")
+	}
+
+	// Apply execution settings, surfacing a rejected option (e.g. an invalid
+	// memory_limit or temp_directory) instead of silently running with
+	// unintended defaults.
+	pragmas := []string{
+		fmt.Sprintf("PRAGMA memory_limit='%s'", opts.MemoryLimit),
+		fmt.Sprintf("PRAGMA threads=%d", opts.Threads),
+	}
+	if opts.TempDir != "" {
+		pragmas = append(pragmas, fmt.Sprintf("PRAGMA temp_directory='%s'", opts.TempDir))
+	}
+	for _, p := range pragmas {
+		if _, err := db.Exec(p); err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("configure duckdb (%s): %w", p, err)
+		}
 	}
 	return db, cleanup, nil
 }
