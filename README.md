@@ -95,9 +95,12 @@ The resulting guarantees:
   orphaned output is garbage-collected on the next run.
 - **Retry-idempotent.** Consumed `inc/` inputs are recorded and removed before
   the next publish, so aggregates such as `sum` are never double-applied.
-- **Simple reads.** Active files are primary-key-disjoint, so reading is a plain
-  `read_parquet([active_files])` — merge strategies run only at compaction,
-  never at read time.
+- **Simple reads.** Active files are primary-key-disjoint, so a read is a plain
+  `read_parquet([active_files])` — merge strategies run only at compaction, never
+  at read time. (Derive partition keys from the immutable primary key, as in the
+  examples, so a key never moves partitions; partitioning by a mutable field can
+  leave the same key active in two partitions, which a cross-partition read would
+  then need to dedup.)
 - **Bounded.** DuckDB memory and threads, merge workers, import buffering, and
   the bloom rewrite are all capped (see Tuning), so large workloads stay within
   memory.
