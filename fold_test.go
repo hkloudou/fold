@@ -1089,3 +1089,80 @@ func TestMergeIgnoresUncommittedFirstPublishOutput(t *testing.T) {
 		t.Fatal("uncommitted output was not garbage-collected")
 	}
 }
+
+func TestCompactOptionsDefaults(t *testing.T) {
+	got := CompactOptions{}.normalized()
+	if got.Workers != defaultCompactWorkers {
+		t.Fatalf("default workers = %d, want %d", got.Workers, defaultCompactWorkers)
+	}
+	if got.DuckDB.MemoryLimit != defaultMemoryLimit {
+		t.Fatalf("default memory limit = %q, want %q", got.DuckDB.MemoryLimit, defaultMemoryLimit)
+	}
+	if got.DuckDB.Threads != defaultThreads {
+		t.Fatalf("default threads = %d, want %d", got.DuckDB.Threads, defaultThreads)
+	}
+
+	// Explicit values are preserved; only unset fields are defaulted.
+	custom := CompactOptions{Workers: 2, DuckDB: DuckDBOptions{Threads: 1, TempDir: "/tmp/x"}}.normalized()
+	if custom.Workers != 2 || custom.DuckDB.Threads != 1 || custom.DuckDB.TempDir != "/tmp/x" {
+		t.Fatalf("explicit options not preserved: %+v", custom)
+	}
+	if custom.DuckDB.MemoryLimit != defaultMemoryLimit {
+		t.Fatalf("unset memory limit not defaulted: %q", custom.DuckDB.MemoryLimit)
+	}
+}
+
+func TestMergeWithCustomDuckDBOptions(t *testing.T) {
+	db, err := Open(t.TempDir(), WithCompactOptions(CompactOptions{
+		Workers: 2,
+		DuckDB:  DuckDBOptions{MemoryLimit: "512MB", Threads: 2, TempDir: t.TempDir()},
+	}))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	if db.compact.Workers != 2 || db.compact.DuckDB.MemoryLimit != "512MB" || db.compact.DuckDB.Threads != 2 {
+		t.Fatalf("options not applied: %+v", db.compact)
+	}
+
+	table := Register[PartitionedRow](db)
+	if err := table.Import("s", []PartitionedRow{
+		{ID: "aa1", Name: "Alpha", Region: "west", UpdatedAt: 1},
+		{ID: "bb1", Name: "Beta", Region: "east", UpdatedAt: 1},
+	}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge with custom options: %v", err)
+	}
+
+	queryDB := openQueryDB(t)
+	defer queryDB.Close()
+	var count int
+	glob := filepath.Join(table.mainDir(), "**", "*.parquet")
+	if err := queryDB.QueryRow(fmt.Sprintf(`SELECT count(*) FROM read_parquet('%s', union_by_name=true)`, glob)).Scan(&count); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("row count = %d, want 2", count)
+	}
+}
+
+// TestMergeRejectsInvalidDuckDBOption verifies a rejected DuckDB option surfaces
+// as an error instead of silently falling back to defaults.
+func TestMergeRejectsInvalidDuckDBOption(t *testing.T) {
+	db, err := Open(t.TempDir(), WithCompactOptions(CompactOptions{
+		DuckDB: DuckDBOptions{MemoryLimit: "not-a-valid-size"},
+	}))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+	if err := table.Import("b", []MergeRow{{ID: "x", Total: 1}}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := table.Merge(); err == nil {
+		t.Fatal("merge should fail when a DuckDB option is invalid, but it succeeded")
+	}
+}

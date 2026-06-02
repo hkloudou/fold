@@ -15,8 +15,6 @@ import (
 	_ "github.com/marcboeker/go-duckdb/v2"
 )
 
-const mergeWorkers = 10
-
 // Merge performs the CRDT-style merge from inc/ into main/.
 func (t *Table[T]) Merge() error {
 	schema := t.schema
@@ -58,7 +56,7 @@ func (t *Table[T]) mergePartitioned(incFiles []string) error {
 	var wg sync.WaitGroup
 	var mergedCount int64
 
-	workers := mergeWorkers
+	workers := t.db.compact.Workers
 	if workers > len(partDirs) {
 		workers = len(partDirs)
 	}
@@ -141,7 +139,7 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 		return err
 	}
 
-	db, cleanup, err := openDuckDB(mainPartDir)
+	db, cleanup, err := openDuckDB(mainPartDir, t.db.compact.DuckDB)
 	if err != nil {
 		return err
 	}
@@ -205,7 +203,7 @@ func (t *Table[T]) mergeFull() error {
 
 	log.Printf("[Fold] %s: full merge inc=%d main=%d", schema.Name, len(incFiles), len(mainFiles))
 
-	db, cleanup, err := openDuckDB(mainDir)
+	db, cleanup, err := openDuckDB(mainDir, t.db.compact.DuckDB)
 	if err != nil {
 		return err
 	}
@@ -372,19 +370,33 @@ FULL OUTER JOIN main_view t ON %s`,
 
 // --- DuckDB helpers ---
 
-func openDuckDB(dir string) (db *sql.DB, cleanup func(), err error) {
+func openDuckDB(dir string, opts DuckDBOptions) (db *sql.DB, cleanup func(), err error) {
 	dbPath := filepath.Join(dir, fmt.Sprintf(".duckdb_%d.db", time.Now().UnixNano()))
 	db, err = sql.Open("duckdb", dbPath)
 	if err != nil {
 		return nil, nil, err
 	}
-	db.Exec("PRAGMA memory_limit='2GB'")
-	db.Exec("PRAGMA threads=4")
-
 	cleanup = func() {
 		db.Close()
 		os.Remove(dbPath)
 		os.Remove(dbPath + ".wal")
+	}
+
+	// Apply execution settings, surfacing a rejected option (e.g. an invalid
+	// memory_limit or temp_directory) instead of silently running with
+	// unintended defaults.
+	pragmas := []string{
+		fmt.Sprintf("PRAGMA memory_limit='%s'", opts.MemoryLimit),
+		fmt.Sprintf("PRAGMA threads=%d", opts.Threads),
+	}
+	if opts.TempDir != "" {
+		pragmas = append(pragmas, fmt.Sprintf("PRAGMA temp_directory='%s'", opts.TempDir))
+	}
+	for _, p := range pragmas {
+		if _, err := db.Exec(p); err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("configure duckdb (%s): %w", p, err)
+		}
 	}
 	return db, cleanup, nil
 }

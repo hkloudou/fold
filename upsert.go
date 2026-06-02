@@ -68,7 +68,7 @@ func (t *Table[T]) upsertFull(rows []map[string]any) error {
 		return nil
 	}
 
-	db, cleanup, err := openDuckDB(mainDir)
+	db, cleanup, err := openDuckDB(mainDir, t.db.compact.DuckDB)
 	if err != nil {
 		return err
 	}
@@ -138,7 +138,7 @@ func (t *Table[T]) upsertPartitioned(rows []map[string]any) error {
 	var wg sync.WaitGroup
 	var upsertedCount int64
 
-	workers := mergeWorkers
+	workers := t.db.compact.Workers
 	if workers > len(groups) {
 		workers = len(groups)
 	}
@@ -210,7 +210,7 @@ func (t *Table[T]) upsertOnePartition(partDir string, rows []map[string]any) err
 		return nil
 	}
 
-	db, cleanup, err := openDuckDB(mainPartDir)
+	db, cleanup, err := openDuckDB(mainPartDir, t.db.compact.DuckDB)
 	if err != nil {
 		return err
 	}
