@@ -1166,3 +1166,125 @@ func TestMergeRejectsInvalidDuckDBOption(t *testing.T) {
 		t.Fatal("merge should fail when a DuckDB option is invalid, but it succeeded")
 	}
 }
+
+func TestImportOptionsDefaults(t *testing.T) {
+	got := ImportOptions{}.normalized()
+	if got.MaxRowsPerFile != defaultMaxRowsPerFile {
+		t.Fatalf("default MaxRowsPerFile = %d, want %d", got.MaxRowsPerFile, defaultMaxRowsPerFile)
+	}
+	if got.MaxOpenPartitionWriters != defaultMaxOpenPartitionWriters {
+		t.Fatalf("default MaxOpenPartitionWriters = %d, want %d", got.MaxOpenPartitionWriters, defaultMaxOpenPartitionWriters)
+	}
+}
+
+// TestImportWriterFlushesByRowCount proves the streaming writer flushes inc
+// files mid-stream rather than buffering the whole batch: 25 rows with a 10-row
+// threshold must produce 3 files, and all 25 rows survive a merge.
+func TestImportWriterFlushesByRowCount(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+
+	w := table.NewImportWriter("stream", ImportOptions{MaxRowsPerFile: 10})
+	for i := 0; i < 25; i++ {
+		if err := w.Add(MergeRow{ID: fmt.Sprintf("id-%02d", i), Total: int64(i)}); err != nil {
+			t.Fatalf("add %d: %v", i, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if incFiles := listParquetFiles(table.incDir()); len(incFiles) != 3 {
+		t.Fatalf("expected 3 flushed inc files (10+10+5), got %d", len(incFiles))
+	}
+
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	queryDB := openQueryDB(t)
+	defer queryDB.Close()
+	files := buildFileList(listParquetFiles(table.mainDir()))
+	var count int
+	if err := queryDB.QueryRow(fmt.Sprintf(`SELECT count(*) FROM read_parquet([%s], union_by_name=true)`, files)).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 25 {
+		t.Fatalf("merged row count = %d, want 25", count)
+	}
+}
+
+// TestImportRowsStreamingPartitioned exercises the iterator API across
+// partitions with a small flush threshold.
+func TestImportRowsStreamingPartitioned(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[PartitionedRow](db)
+
+	seq := func(yield func(PartitionedRow) bool) {
+		for i := 0; i < 6; i++ {
+			if !yield(PartitionedRow{ID: fmt.Sprintf("k%d", i), Name: "n", Region: "r", UpdatedAt: int64(i)}) {
+				return
+			}
+		}
+	}
+	if err := table.ImportRows("stream", seq, ImportOptions{MaxRowsPerFile: 2}); err != nil {
+		t.Fatalf("import rows: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	queryDB := openQueryDB(t)
+	defer queryDB.Close()
+	glob := filepath.Join(table.mainDir(), "**", "*.parquet")
+	var count int
+	if err := queryDB.QueryRow(fmt.Sprintf(`SELECT count(*) FROM read_parquet('%s', union_by_name=true)`, glob)).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 6 {
+		t.Fatalf("row count = %d, want 6", count)
+	}
+}
+
+// TestImportWriterBoundsOpenPartitions verifies that capping open partition
+// writers (forcing eviction flushes) loses no data.
+func TestImportWriterBoundsOpenPartitions(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[PartitionedRow](db)
+
+	w := table.NewImportWriter("stream", ImportOptions{MaxRowsPerFile: 1000, MaxOpenPartitionWriters: 1})
+	ids := []string{"aa1", "bb1", "cc1", "aa2", "dd1"}
+	for _, id := range ids {
+		if err := w.Add(PartitionedRow{ID: id, Name: "n", Region: "r", UpdatedAt: 1}); err != nil {
+			t.Fatalf("add %s: %v", id, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	queryDB := openQueryDB(t)
+	defer queryDB.Close()
+	glob := filepath.Join(table.mainDir(), "**", "*.parquet")
+	var count int
+	if err := queryDB.QueryRow(fmt.Sprintf(`SELECT count(*) FROM read_parquet('%s', union_by_name=true)`, glob)).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != len(ids) {
+		t.Fatalf("row count = %d, want %d", count, len(ids))
+	}
+}

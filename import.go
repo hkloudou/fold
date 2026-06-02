@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -21,112 +20,78 @@ import (
 	"github.com/google/uuid"
 )
 
-// Import writes typed records into the inc/ area.
-// source identifies the data producer; records is a user-defined struct slice.
+// Import writes typed records into the inc/ area. It is a convenience wrapper
+// over the streaming writer for small batches; large flows should use
+// ImportRows or NewImportWriter so the whole batch need not be materialized.
 func (t *Table[T]) Import(source string, records []T) error {
-	if len(records) == 0 {
-		return nil
-	}
-
-	schema := t.schema
-
-	// Extract all record values into []map[column]any by reflection.
-	rows, err := extractRows(schema, records)
-	if err != nil {
-		return err
-	}
-
-	// Sort by composite primary key.
-	pkCols := schema.PKColumns()
-	sort.Slice(rows, func(i, j int) bool {
-		for _, col := range pkCols {
-			a, _ := rows[i][col].(string)
-			b, _ := rows[j][col].(string)
-			if a != b {
-				return a < b
-			}
-		}
-		return false
-	})
-
-	// Group rows by partition rules.
-	if len(schema.Partitions) > 0 {
-		groups := groupByPartitions(rows, schema)
-		for partDir, groupRows := range groups {
-			outDir := filepath.Join(t.incDir(), source, partDir)
-			if err := writeParquet(outDir, schema, groupRows); err != nil {
-				return fmt.Errorf("fold: write partition %s: %w", partDir, err)
-			}
-		}
-	} else {
-		outDir := filepath.Join(t.incDir(), source)
-		if err := writeParquet(outDir, schema, rows); err != nil {
-			return fmt.Errorf("fold: write failed: %w", err)
+	w := t.NewImportWriter(source, ImportOptions{})
+	for i := range records {
+		if err := w.Add(records[i]); err != nil {
+			return err
 		}
 	}
-
-	return nil
+	return w.Close()
 }
 
-// extractRows converts []T into []map[column]any by reflection.
-func extractRows[T any](schema *Schema, records []T) ([]map[string]any, error) {
-	rows := make([]map[string]any, 0, len(records))
-	for _, rec := range records {
-		rv := reflect.ValueOf(rec)
-		if rv.Kind() == reflect.Ptr {
-			rv = rv.Elem()
-		}
-		row := make(map[string]any, len(schema.Fields))
-		for _, f := range schema.Fields {
-			fv := rv.Field(f.Index)
-			if fv.IsZero() {
-				continue // Skip zero values instead of writing them to Parquet.
-			}
-			if f.Strategy == StrategyJSONMerge {
-				// json_merge: pass string/[]byte through; serialize other values.
-				switch v := fv.Interface().(type) {
-				case string:
-					row[f.Column] = v
-				case []byte:
-					row[f.Column] = string(v)
-				default:
-					b, err := json.Marshal(v)
-					if err != nil {
-						return nil, fmt.Errorf("serialize json_merge field %s: %w", f.Column, err)
-					}
-					row[f.Column] = string(b)
-				}
-			} else {
-				row[f.Column] = fv.Interface()
-			}
-		}
-		// Drop rows with any missing primary-key column.
-		allPKs := true
-		for _, pk := range schema.PKs {
-			if _, ok := row[pk.Column]; !ok {
-				allPKs = false
-				break
-			}
-		}
-		if !allPKs {
-			continue
-		}
-		rows = append(rows, row)
+// extractRow converts one record into a map[column]any by reflection. It
+// returns ok=false when the record is missing a primary-key column (and is
+// therefore skipped, matching Import's behavior).
+func extractRow(schema *Schema, rec any) (map[string]any, bool, error) {
+	rv := reflect.ValueOf(rec)
+	if rv.Kind() == reflect.Ptr {
+		rv = rv.Elem()
 	}
-	return rows, nil
+	row := make(map[string]any, len(schema.Fields))
+	for _, f := range schema.Fields {
+		fv := rv.Field(f.Index)
+		if fv.IsZero() {
+			continue // Skip zero values instead of writing them to Parquet.
+		}
+		if f.Strategy == StrategyJSONMerge {
+			// json_merge: pass string/[]byte through; serialize other values.
+			switch v := fv.Interface().(type) {
+			case string:
+				row[f.Column] = v
+			case []byte:
+				row[f.Column] = string(v)
+			default:
+				b, err := json.Marshal(v)
+				if err != nil {
+					return nil, false, fmt.Errorf("serialize json_merge field %s: %w", f.Column, err)
+				}
+				row[f.Column] = string(b)
+			}
+		} else {
+			row[f.Column] = fv.Interface()
+		}
+	}
+	// Drop rows with any missing primary-key column.
+	for _, pk := range schema.PKs {
+		if _, ok := row[pk.Column]; !ok {
+			return nil, false, nil
+		}
+	}
+	return row, true, nil
+}
+
+// partitionDirFor returns the partition subdirectory for a row, or "" when the
+// table is unpartitioned.
+func partitionDirFor(row map[string]any, schema *Schema) string {
+	if len(schema.Partitions) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(schema.Partitions))
+	for _, p := range schema.Partitions {
+		parts = append(parts, fmt.Sprintf("%s=%s", p.Key, evalPartition(row, p, schema)))
+	}
+	return filepath.Join(parts...)
 }
 
 // groupByPartitions groups rows by partition rules.
 func groupByPartitions(rows []map[string]any, schema *Schema) map[string][]map[string]any {
 	groups := make(map[string][]map[string]any)
-
 	for _, row := range rows {
-		var parts []string
-		for _, p := range schema.Partitions {
-			val := evalPartition(row, p, schema)
-			parts = append(parts, fmt.Sprintf("%s=%s", p.Key, val))
-		}
-		key := filepath.Join(parts...)
+		key := partitionDirFor(row, schema)
 		groups[key] = append(groups[key], row)
 	}
 	return groups

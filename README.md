@@ -149,6 +149,27 @@ db, _ := fold.Open("./data", fold.WithCompactOptions(fold.CompactOptions{
 Unset fields fall back to defaults: 10 workers, `2GB` memory, 4 threads, and no
 explicit temp directory.
 
+## Streaming import
+
+`Import` materializes its slice. For large flows use the streaming writer, which
+appends inc files bounded by row count (or estimated bytes) without holding the
+whole batch in memory:
+
+```go
+w := table.NewImportWriter("source", fold.ImportOptions{MaxRowsPerFile: 50_000})
+for scanner.Scan() {
+	if err := w.Add(parse(scanner.Text())); err != nil {
+		return err
+	}
+}
+if err := w.Close(); err != nil { // flushes remaining buffers
+	return err
+}
+```
+
+Or stream from an iterator with `table.ImportRows("source", seq, fold.ImportOptions{})`.
+Streaming import only appends to `inc/`; call `Merge` afterwards to compact.
+
 ## Readers
 
 Fold includes lightweight helpers for Excel and JSONL ingestion.
