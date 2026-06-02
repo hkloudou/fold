@@ -9,9 +9,11 @@ stable `main/` Parquet files using merge strategies declared on Go struct tags.
 
 ## Status
 
-This is an early foundation release. The current implementation targets local
-filesystem workflows and batch-oriented merges. Object storage manifests,
-bounded-memory compaction, and production scheduling are expected future layers.
+Fold runs on the local filesystem with crash-safe, retry-idempotent,
+manifest-backed merges, streaming import, and configurable resource bounds. An
+object-storage adapter (and direct DuckDB `s3://` / `httpfs` I/O), LSM-style
+levels, and a scheduler are deliberately deferred — the `Storage` seam is in
+place so a remote backend can be added later without changing the merge model.
 
 ## Install
 
@@ -72,6 +74,36 @@ func main() {
 	}
 }
 ```
+
+## How it works
+
+Fold is an append-and-compact engine:
+
+1. **Append.** `Import` / `ImportRows` write immutable Parquet into `inc/`; they
+   never merge inline.
+2. **Compact.** `Merge` reads a partition's active files plus its pending `inc/`
+   files, applies the declared strategies in DuckDB, and publishes one new
+   segment under `files/`.
+3. **Publish.** Each partition's `_manifest.json` lists its active files, and a
+   `_commit_<tx>.json` records the inputs consumed and outputs produced. Writing
+   the manifest is the single commit point.
+
+The resulting guarantees:
+
+- **Crash-safe.** Output is staged and validated before the manifest references
+  it. A crash before the commit leaves the previous state authoritative; the
+  orphaned output is garbage-collected on the next run.
+- **Retry-idempotent.** Consumed `inc/` inputs are recorded and removed before
+  the next publish, so aggregates such as `sum` are never double-applied.
+- **Simple reads.** Active files are primary-key-disjoint, so a read is a plain
+  `read_parquet([active_files])` — merge strategies run only at compaction, never
+  at read time. (Derive partition keys from the immutable primary key, as in the
+  examples, so a key never moves partitions; partitioning by a mutable field can
+  leave the same key active in two partitions, which a cross-partition read would
+  then need to dedup.)
+- **Bounded.** DuckDB memory and threads, merge workers, import buffering, and
+  the bloom rewrite are all capped (see Tuning), so large workloads stay within
+  memory.
 
 ## Merge Strategies
 
