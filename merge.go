@@ -168,10 +168,12 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 		}
 	}
 
-	// Publish crash-safely: write the merged result to a staging file, validate
-	// it, then rename it into place. Existing main files are never removed before
-	// the replacement is durably written, so a crash cannot leave the partition
-	// without data. (Retry idempotency after a successful publish is #4.)
+	// Publish crash-safely: write the merged result to a staging file, finish it
+	// completely — including the bloom rewrite — validate it, and only then
+	// rename it into place. The staging file never becomes visible until it is a
+	// complete replacement, and the active main files are not removed until
+	// after that, so a crash at any step leaves the partition's data intact.
+	// (Retry idempotency after a successful publish is #4.)
 	ts := time.Now().UnixMilli()
 	tmpFile := filepath.Join(mainPartDir, fmt.Sprintf(".merged_%d.parquet.tmp", ts))
 	finalFile := filepath.Join(mainPartDir, fmt.Sprintf("merged_%d.parquet", ts))
@@ -179,6 +181,12 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 	if _, err := db.Exec(fmt.Sprintf(`COPY result TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3)`, tmpFile)); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("write result: %w", err)
+	}
+
+	// Bloom rewrite runs on the staging file, before it becomes active.
+	if err := addBloomFilters(tmpFile, schema); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("add bloom filters: %w", err)
 	}
 
 	if err := validateStagedParquet(db, tmpFile); err != nil {
@@ -189,11 +197,6 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 	if err := os.Rename(tmpFile, finalFile); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("publish result: %w", err)
-	}
-
-	// Add bloom filters for bloom-enabled columns (rewrites finalFile in place).
-	if err := addBloomFilters(finalFile, schema); err != nil {
-		return fmt.Errorf("add bloom filters: %w", err)
 	}
 
 	// The replacement is now active; remove superseded main files, then inc.
@@ -252,7 +255,9 @@ func (t *Table[T]) mergeFull(incFiles, mainFiles []string) error {
 		}
 	}
 
-	// Atomic write.
+	// Publish crash-safely: finish the staging file completely — including the
+	// bloom rewrite — validate it, then rename it into place, so the replacement
+	// only becomes visible once it is a complete file.
 	ts := time.Now().UnixMilli()
 	tmpFile := filepath.Join(t.mainDir(), fmt.Sprintf(".merged_%d.parquet.tmp", ts))
 	finalFile := filepath.Join(t.mainDir(), fmt.Sprintf("merged_%d.parquet", ts))
@@ -260,6 +265,12 @@ func (t *Table[T]) mergeFull(incFiles, mainFiles []string) error {
 	if _, err := db.Exec(fmt.Sprintf(`COPY result TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3)`, tmpFile)); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("write result: %w", err)
+	}
+
+	// Bloom rewrite runs on the staging file, before it becomes active.
+	if err := addBloomFilters(tmpFile, schema); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("add bloom filters: %w", err)
 	}
 
 	if err := validateStagedParquet(db, tmpFile); err != nil {
@@ -270,11 +281,6 @@ func (t *Table[T]) mergeFull(incFiles, mainFiles []string) error {
 	if err := os.Rename(tmpFile, finalFile); err != nil {
 		os.Remove(tmpFile)
 		return err
-	}
-
-	// Add bloom filters for bloom-enabled columns.
-	if err := addBloomFilters(finalFile, schema); err != nil {
-		return fmt.Errorf("add bloom filters: %w", err)
 	}
 
 	// Clean up.

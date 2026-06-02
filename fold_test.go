@@ -469,6 +469,19 @@ func TestPartitionedMergeStagedPublish(t *testing.T) {
 			t.Fatalf("row %s = %q, want %q", id, got[id], w)
 		}
 	}
+
+	// The published files must already carry the bloom filter on the bloom
+	// column: the bloom rewrite runs on the staging file before it becomes
+	// active, so an active main file is never bloom-incomplete.
+	var bloomChunks int
+	if err := queryDB.QueryRow(fmt.Sprintf(
+		`SELECT count(*) FROM parquet_metadata('%s') WHERE path_in_schema = 'id' AND bloom_filter_offset IS NOT NULL`, glob,
+	)).Scan(&bloomChunks); err != nil {
+		t.Fatalf("bloom metadata query: %v", err)
+	}
+	if bloomChunks == 0 {
+		t.Fatal("published main files carry no bloom filter on id; bloom did not complete before publish")
+	}
 }
 
 func TestUpsertCompositePrimaryKey(t *testing.T) {
