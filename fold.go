@@ -42,12 +42,21 @@ type DuckDBOptions struct {
 type CompactOptions struct {
 	Workers int           // concurrent partition workers (default 10)
 	DuckDB  DuckDBOptions // per-job DuckDB execution options
+
+	// DisableBloom turns off the post-merge bloom-filter rewrite entirely.
+	// Bloom filters only speed up primary-key lookups; they are never required
+	// for correctness, so disabling them is always safe.
+	DisableBloom bool
+	// BloomMaxFileBytes skips the bloom rewrite when a staged output exceeds
+	// this size, bounding the rewrite's (whole-file) memory use. Default 256 MiB.
+	BloomMaxFileBytes int64
 }
 
 const (
-	defaultCompactWorkers = 10
-	defaultMemoryLimit    = "2GB"
-	defaultThreads        = 4
+	defaultCompactWorkers    = 10
+	defaultMemoryLimit       = "2GB"
+	defaultThreads           = 4
+	defaultBloomMaxFileBytes = 256 << 20 // 256 MiB
 )
 
 // normalized fills unset fields with conservative defaults.
@@ -60,6 +69,9 @@ func (o CompactOptions) normalized() CompactOptions {
 	}
 	if o.DuckDB.Threads <= 0 {
 		o.DuckDB.Threads = defaultThreads
+	}
+	if o.BloomMaxFileBytes <= 0 {
+		o.BloomMaxFileBytes = defaultBloomMaxFileBytes
 	}
 	return o
 }
