@@ -374,7 +374,14 @@ func (s Strategy) IncAggExpr(field string) string {
 	case StrategyCoalesce:
 		return fmt.Sprintf("COALESCE(MAX(%s), FIRST(%s)) AS %s", field, field, field)
 	case StrategyJSONMerge:
-		return fmt.Sprintf("ANY_VALUE(%s) AS %s", field, field)
+		// Fold every patch for the primary key (RFC 7396) instead of keeping an
+		// arbitrary one as ANY_VALUE did, which silently dropped patches.
+		// Non-conflicting keys union. For a key set to different values within a
+		// single batch, folding in ascending patch-text order makes the greatest
+		// patch win — a stable tie-break, not a temporal one, because Fold keeps
+		// no per-row sequence within a batch. Temporal precedence (a later merge
+		// wins) is applied across merge cycles by GetSQLExpr. NULLs are skipped.
+		return fmt.Sprintf("CAST(list_reduce(list(CAST(%[1]s AS JSON) ORDER BY %[1]s) FILTER (WHERE %[1]s IS NOT NULL), (a, b) -> json_merge_patch(a, b)) AS VARCHAR) AS %[1]s", field)
 	case StrategyMax:
 		return fmt.Sprintf("MAX(%s) AS %s", field, field)
 	case StrategyMin:

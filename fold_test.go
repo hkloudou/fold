@@ -253,6 +253,102 @@ func TestImportMergeStrategies(t *testing.T) {
 	}
 }
 
+// TestJSONMergeConflictContract locks the json_merge conflict contract so the
+// behavior cannot drift undocumented:
+//   - Non-conflicting keys always union, regardless of how rows are batched
+//     (this is the original silent-data-loss regression).
+//   - Across merge cycles, a later batch wins for a conflicting key (temporal
+//     last-write-wins, handled by the FULL OUTER JOIN merge in GetSQLExpr).
+//   - Within a single batch, conflicting keys are folded in ascending JSON-text
+//     order (the greatest patch wins), independent of row order: Fold keeps no
+//     per-row sequence inside a batch. Callers express precedence with separate
+//     merge cycles.
+func TestJSONMergeConflictContract(t *testing.T) {
+	// (1) Non-conflicting patches in one batch must all survive.
+	meta := mergeJSONOneBatch(t, "a", []string{`{"x":"1"}`, `{"y":"2"}`, `{"z":"3"}`})
+	for _, key := range []string{`"x":"1"`, `"y":"2"`, `"z":"3"`} {
+		if !strings.Contains(meta, key) {
+			t.Fatalf("non-conflicting patch dropped: meta=%s missing %s", meta, key)
+		}
+	}
+
+	// (2) A same-batch conflict is resolved by ascending JSON-text order, so the
+	// lexicographically-greatest patch wins the key, independent of input row
+	// order: {"k":"b"} > {"k":"a"}, so "b" wins either way.
+	forward := mergeJSONOneBatch(t, "a", []string{`{"k":"a"}`, `{"k":"b"}`})
+	reverse := mergeJSONOneBatch(t, "a", []string{`{"k":"b"}`, `{"k":"a"}`})
+	if forward != reverse {
+		t.Fatalf("same-batch conflict not order-independent: %q vs %q", forward, reverse)
+	}
+	if !strings.Contains(forward, `"k":"b"`) {
+		t.Fatalf("same-batch conflict should pick the greatest patch by JSON text: meta=%s", forward)
+	}
+
+	// (3) Across merge cycles, the later batch wins for a conflicting key. This
+	// is the documented way to express precedence.
+	later := mergeJSONAcrossBatches(t, "a", []string{`{"k":"old"}`, `{"k":"new"}`})
+	if !strings.Contains(later, `"k":"new"`) {
+		t.Fatalf("cross-batch conflict must be last-write-wins: meta=%s", later)
+	}
+}
+
+// mergeJSONOneBatch imports every patch for one primary key in a single batch,
+// merges once, and returns the stored json_merge column.
+func mergeJSONOneBatch(t *testing.T, id string, patches []string) string {
+	t.Helper()
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+	rows := make([]MergeRow, len(patches))
+	for i, p := range patches {
+		rows[i] = MergeRow{ID: id, Meta: p}
+	}
+	if err := table.Import("batch", rows); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	return queryMeta(t, table.mainDir(), id)
+}
+
+// mergeJSONAcrossBatches imports each patch as its own batch and merge cycle.
+func mergeJSONAcrossBatches(t *testing.T, id string, patches []string) string {
+	t.Helper()
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+	for i, p := range patches {
+		if err := table.Import(fmt.Sprintf("batch-%d", i), []MergeRow{{ID: id, Meta: p}}); err != nil {
+			t.Fatalf("import batch %d: %v", i, err)
+		}
+		if err := table.Merge(); err != nil {
+			t.Fatalf("merge batch %d: %v", i, err)
+		}
+	}
+	return queryMeta(t, table.mainDir(), id)
+}
+
+func queryMeta(t *testing.T, dir, id string) string {
+	t.Helper()
+	queryDB := openQueryDB(t)
+	defer queryDB.Close()
+	files := buildFileList(listParquetFiles(dir))
+	var meta string
+	if err := queryDB.QueryRow(fmt.Sprintf(
+		`SELECT meta FROM read_parquet([%s], union_by_name=true) WHERE id='%s'`, files, id,
+	)).Scan(&meta); err != nil {
+		t.Fatalf("query meta for %s: %v", id, err)
+	}
+	return meta
+}
+
 func TestPartitionedMerge(t *testing.T) {
 	db, err := Open(t.TempDir())
 	if err != nil {
