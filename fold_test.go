@@ -384,6 +384,106 @@ func TestPartitionedMerge(t *testing.T) {
 	}
 }
 
+// TestPartitionedMergeStagedPublish exercises the crash-safe publish path: a
+// second merge into a partition that already has main data must stage and
+// validate the replacement before removing the old file, leaving no duplicate
+// primary keys and no staging temp files behind.
+func TestPartitionedMergeStagedPublish(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[PartitionedRow](db)
+
+	// First merge establishes main files for two partitions.
+	if err := table.Import("s1", []PartitionedRow{
+		{ID: "aa1", Name: "Alpha", Region: "west", UpdatedAt: 100},
+		{ID: "bb1", Name: "Beta", Region: "east", UpdatedAt: 100},
+	}); err != nil {
+		t.Fatalf("import s1: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge s1: %v", err)
+	}
+
+	// Second merge updates an existing row (same partition, existing main) and
+	// adds a new one, exercising replacement over active data.
+	if err := table.Import("s2", []PartitionedRow{
+		{ID: "aa1", Name: "AlphaV2", Region: "west", UpdatedAt: 200},
+		{ID: "cc1", Name: "Gamma", Region: "south", UpdatedAt: 150},
+	}); err != nil {
+		t.Fatalf("import s2: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge s2: %v", err)
+	}
+
+	// No staging temp file may survive a successful publish.
+	filepath.Walk(table.mainDir(), func(p string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() && strings.HasSuffix(info.Name(), ".tmp") {
+			t.Fatalf("staging temp file left behind: %s", p)
+		}
+		return nil
+	})
+
+	queryDB := openQueryDB(t)
+	defer queryDB.Close()
+	glob := filepath.Join(table.mainDir(), "**", "*.parquet")
+
+	// No duplicate primary keys: the superseded main file must be removed, not
+	// left alongside the replacement.
+	var dups int
+	if err := queryDB.QueryRow(fmt.Sprintf(
+		`SELECT count(*) FROM (SELECT id FROM read_parquet('%s', union_by_name=true) GROUP BY id HAVING count(*) > 1)`, glob,
+	)).Scan(&dups); err != nil {
+		t.Fatalf("duplicate check: %v", err)
+	}
+	if dups != 0 {
+		t.Fatalf("found %d duplicated primary keys after re-merge", dups)
+	}
+
+	// The overwrite landed and no rows were lost.
+	rows, err := queryDB.Query(fmt.Sprintf(
+		`SELECT id, name, updated_at FROM read_parquet('%s', union_by_name=true) ORDER BY id`, glob,
+	))
+	if err != nil {
+		t.Fatalf("query rows: %v", err)
+	}
+	defer rows.Close()
+	got := map[string]string{}
+	for rows.Next() {
+		var id, name string
+		var updated int64
+		if err := rows.Scan(&id, &name, &updated); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got[id] = fmt.Sprintf("%s/%d", name, updated)
+	}
+	want := map[string]string{"aa1": "AlphaV2/200", "bb1": "Beta/100", "cc1": "Gamma/150"}
+	if len(got) != len(want) {
+		t.Fatalf("row set = %v, want %v", got, want)
+	}
+	for id, w := range want {
+		if got[id] != w {
+			t.Fatalf("row %s = %q, want %q", id, got[id], w)
+		}
+	}
+
+	// The published files must already carry the bloom filter on the bloom
+	// column: the bloom rewrite runs on the staging file before it becomes
+	// active, so an active main file is never bloom-incomplete.
+	var bloomChunks int
+	if err := queryDB.QueryRow(fmt.Sprintf(
+		`SELECT count(*) FROM parquet_metadata('%s') WHERE path_in_schema = 'id' AND bloom_filter_offset IS NOT NULL`, glob,
+	)).Scan(&bloomChunks); err != nil {
+		t.Fatalf("bloom metadata query: %v", err)
+	}
+	if bloomChunks == 0 {
+		t.Fatal("published main files carry no bloom filter on id; bloom did not complete before publish")
+	}
+}
+
 func TestUpsertCompositePrimaryKey(t *testing.T) {
 	db, err := Open(t.TempDir())
 	if err != nil {
