@@ -94,6 +94,19 @@ Declare strategies with the `bd` struct tag.
 | `sum` | Add values together. |
 | `expr:SQL;agg:SQL` | Provide custom DuckDB SQL for merge and inc pre-aggregation. |
 
+### json_merge conflict contract
+
+`json_merge` follows RFC 7396 JSON Merge Patch. Non-conflicting keys are always
+merged. When the same key is set to different values, the winner depends on
+where the patches sit relative to a merge:
+
+- **Across merge cycles**, a later `Import` + `Merge` wins (last-write-wins).
+  This is the supported way to express precedence.
+- **Within a single batch**, patches are folded in ascending JSON-text order, so
+  the lexicographically-greatest patch wins the key. Fold keeps no per-row
+  sequence inside a batch, so this is a stable tie-break, not a temporal one.
+  Split patches across merge cycles when order matters.
+
 ## Layout
 
 Fold writes a simple two-area layout:
