@@ -149,6 +149,11 @@ db, _ := fold.Open("./data", fold.WithCompactOptions(fold.CompactOptions{
 Unset fields fall back to defaults: 10 workers, `2GB` memory, 4 threads, and no
 explicit temp directory.
 
+Bloom filters only accelerate primary-key lookups; they are never required for
+correctness. The post-merge rewrite is skipped automatically for outputs larger
+than `BloomMaxFileBytes` (default 256 MiB) to bound its memory, and can be
+turned off entirely with `DisableBloom`.
+
 ## Streaming import
 
 `Import` materializes its slice. For large flows use the streaming writer, which

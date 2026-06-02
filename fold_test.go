@@ -1101,6 +1101,9 @@ func TestCompactOptionsDefaults(t *testing.T) {
 	if got.DuckDB.Threads != defaultThreads {
 		t.Fatalf("default threads = %d, want %d", got.DuckDB.Threads, defaultThreads)
 	}
+	if got.BloomMaxFileBytes != defaultBloomMaxFileBytes {
+		t.Fatalf("default BloomMaxFileBytes = %d, want %d", got.BloomMaxFileBytes, defaultBloomMaxFileBytes)
+	}
 
 	// Explicit values are preserved; only unset fields are defaulted.
 	custom := CompactOptions{Workers: 2, DuckDB: DuckDBOptions{Threads: 1, TempDir: "/tmp/x"}}.normalized()
@@ -1286,5 +1289,87 @@ func TestImportWriterBoundsOpenPartitions(t *testing.T) {
 	}
 	if count != len(ids) {
 		t.Fatalf("row count = %d, want %d", count, len(ids))
+	}
+}
+
+// bloomFilterColumns counts the parquet column chunks under dir that carry a
+// bloom filter on the given column.
+func bloomFilterColumns(t *testing.T, dir, column string) int {
+	t.Helper()
+	queryDB := openQueryDB(t)
+	defer queryDB.Close()
+	glob := filepath.Join(dir, "**", "*.parquet")
+	var n int
+	if err := queryDB.QueryRow(fmt.Sprintf(
+		`SELECT count(*) FROM parquet_metadata('%s') WHERE path_in_schema = '%s' AND bloom_filter_offset IS NOT NULL`, glob, column,
+	)).Scan(&n); err != nil {
+		t.Fatalf("bloom metadata query: %v", err)
+	}
+	return n
+}
+
+// TestBloomRewriteDefaultPresent confirms the bloom rewrite still runs by
+// default for small outputs.
+func TestBloomRewriteDefaultPresent(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+	if err := table.Import("b", []MergeRow{{ID: "x", Total: 1}}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if n := bloomFilterColumns(t, table.mainDir(), "id"); n == 0 {
+		t.Fatal("expected a bloom filter on id by default")
+	}
+}
+
+// TestBloomRewriteCanBeDisabled verifies DisableBloom omits the filter while
+// data stays correct.
+func TestBloomRewriteCanBeDisabled(t *testing.T) {
+	db, err := Open(t.TempDir(), WithCompactOptions(CompactOptions{DisableBloom: true}))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+	if err := table.Import("b", []MergeRow{{ID: "x", Total: 7}}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if n := bloomFilterColumns(t, table.mainDir(), "id"); n != 0 {
+		t.Fatalf("bloom filter present despite DisableBloom: %d chunks", n)
+	}
+	if got := queryTotal(t, table.mainDir(), "x"); got != 7 {
+		t.Fatalf("data wrong after disabling bloom: total=%d, want 7", got)
+	}
+}
+
+// TestBloomRewriteSkippedForLargeOutput verifies the conservative size cap skips
+// the rewrite (here forced with a 1-byte cap) without affecting data.
+func TestBloomRewriteSkippedForLargeOutput(t *testing.T) {
+	db, err := Open(t.TempDir(), WithCompactOptions(CompactOptions{BloomMaxFileBytes: 1}))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+	if err := table.Import("b", []MergeRow{{ID: "x", Total: 3}}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if n := bloomFilterColumns(t, table.mainDir(), "id"); n != 0 {
+		t.Fatalf("bloom filter present despite size cap: %d chunks", n)
+	}
+	if got := queryTotal(t, table.mainDir(), "x"); got != 3 {
+		t.Fatalf("data wrong after skipping bloom: total=%d, want 3", got)
 	}
 }

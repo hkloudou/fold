@@ -267,8 +267,11 @@ func (t *Table[T]) publishMerged(db *sql.DB, dir string, consumedInc []string) e
 		return fmt.Errorf("write result: %w", err)
 	}
 
-	// Bloom rewrite runs on the staging file, before it becomes active.
-	if err := addBloomFilters(tmpFile, t.schema); err != nil {
+	// Bloom rewrite runs on the staging file, before it becomes active. It is
+	// skipped (an optimization, not required for correctness) when disabled or
+	// when the output is large enough that the whole-file rewrite risks memory
+	// pressure.
+	if err := t.maybeAddBloom(tmpFile); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("add bloom filters: %w", err)
 	}
@@ -284,6 +287,26 @@ func (t *Table[T]) publishMerged(db *sql.DB, dir string, consumedInc []string) e
 	}
 
 	return commitActive(dir, []string{finalRel}, consumedInc)
+}
+
+// maybeAddBloom rewrites the staged file with bloom filters unless they are
+// disabled or the output is large enough that the whole-file rewrite would risk
+// memory pressure. Bloom filters only accelerate primary-key lookups; they are
+// never required for correctness, so skipping them is always safe.
+func (t *Table[T]) maybeAddBloom(path string) error {
+	opts := t.db.compact
+	if opts.DisableBloom {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.Size() > opts.BloomMaxFileBytes {
+		log.Printf("[Fold] %s: skipping bloom rewrite for %d-byte output (limit %d)", t.schema.Name, info.Size(), opts.BloomMaxFileBytes)
+		return nil
+	}
+	return addBloomFilters(path, t.schema)
 }
 
 // validateStagedParquet checks that a freshly written parquet file reads back
