@@ -121,12 +121,18 @@ data/
   main/
     table_name/
       partition_key=value/
-        merged_timestamp.parquet
+        _manifest.json           # active file set for this partition
+        _commit_<tx>.json        # inputs consumed / outputs produced by the last commit
+        files/
+          merged_<ts>.parquet    # active data
 ```
 
 `Import` appends typed records into `inc/`. `Merge` compacts pending `inc/`
-files into `main/` by table partition. `Upsert` is available for small direct
-updates, but large pipelines should prefer append-then-merge flows.
+files into `main/` by partition, publishing each result by atomically swapping
+the partition's `_manifest.json`; reads use the manifest's active file list
+rather than a directory glob, so merges are crash-safe and retry-idempotent.
+`Upsert` is available for small direct updates, but large pipelines should
+prefer append-then-merge flows.
 
 ## Readers
 

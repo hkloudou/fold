@@ -32,12 +32,10 @@ func (t *Table[T]) Merge() error {
 		return nil
 	}
 
-	mainFiles := listParquetFiles(mainDir)
-
 	if len(schema.Partitions) > 0 {
 		return t.mergePartitioned(incFiles)
 	}
-	return t.mergeFull(incFiles, mainFiles)
+	return t.mergeFull()
 }
 
 // mergePartitioned merges partitions concurrently.
@@ -112,7 +110,17 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 	schema := t.schema
 	pkCols := schema.PKColumns()
 
-	// Collect inc files for this partition from all sources.
+	mainPartDir := filepath.Join(t.mainDir(), partDir)
+	os.MkdirAll(mainPartDir, 0755)
+
+	// Complete any cleanup an interrupted publish skipped (delete already-consumed
+	// inc, remove superseded/orphaned files) before reading the partition.
+	if err := recoverPartition(mainPartDir); err != nil {
+		return err
+	}
+
+	// Collect inc files for this partition from all sources; recovery has already
+	// removed any that the last commit consumed.
 	var incPartFiles []string
 	sources, _ := os.ReadDir(t.incDir())
 	for _, src := range sources {
@@ -126,9 +134,12 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 		return nil
 	}
 
-	mainPartDir := filepath.Join(t.mainDir(), partDir)
-	mainPartFiles := listParquetFiles(mainPartDir)
-	os.MkdirAll(mainPartDir, 0755)
+	// Active main files come from the manifest, so files left behind by an
+	// interrupted publish are ignored rather than read twice.
+	mainPartFiles, err := activeMainFiles(mainPartDir)
+	if err != nil {
+		return err
+	}
 
 	db, cleanup, err := openDuckDB(mainPartDir)
 	if err != nil {
@@ -168,58 +179,33 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 		}
 	}
 
-	// Publish crash-safely: write the merged result to a staging file, finish it
-	// completely — including the bloom rewrite — validate it, and only then
-	// rename it into place. The staging file never becomes visible until it is a
-	// complete replacement, and the active main files are not removed until
-	// after that, so a crash at any step leaves the partition's data intact.
-	// (Retry idempotency after a successful publish is #4.)
-	ts := time.Now().UnixMilli()
-	tmpFile := filepath.Join(mainPartDir, fmt.Sprintf(".merged_%d.parquet.tmp", ts))
-	finalFile := filepath.Join(mainPartDir, fmt.Sprintf("merged_%d.parquet", ts))
-
-	if _, err := db.Exec(fmt.Sprintf(`COPY result TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3)`, tmpFile)); err != nil {
-		os.Remove(tmpFile)
-		return fmt.Errorf("write result: %w", err)
-	}
-
-	// Bloom rewrite runs on the staging file, before it becomes active.
-	if err := addBloomFilters(tmpFile, schema); err != nil {
-		os.Remove(tmpFile)
-		return fmt.Errorf("add bloom filters: %w", err)
-	}
-
-	if err := validateStagedParquet(db, tmpFile); err != nil {
-		os.Remove(tmpFile)
-		return fmt.Errorf("validate staged output: %w", err)
-	}
-
-	if err := os.Rename(tmpFile, finalFile); err != nil {
-		os.Remove(tmpFile)
-		return fmt.Errorf("publish result: %w", err)
-	}
-
-	// The replacement is now active; remove superseded main files, then inc.
-	for _, f := range mainPartFiles {
-		if f != finalFile {
-			os.Remove(f)
-		}
-	}
-	for _, f := range incPartFiles {
-		os.Remove(f)
-	}
-
-	return nil
+	return t.publishMerged(db, mainPartDir, incPartFiles)
 }
 
 // mergeFull merges an unpartitioned table.
-func (t *Table[T]) mergeFull(incFiles, mainFiles []string) error {
+func (t *Table[T]) mergeFull() error {
 	schema := t.schema
 	pkCols := schema.PKColumns()
+	mainDir := t.mainDir()
+
+	// Complete any cleanup an interrupted publish skipped before reading.
+	if err := recoverPartition(mainDir); err != nil {
+		return err
+	}
+
+	incFiles := listParquetFiles(t.incDir())
+	if len(incFiles) == 0 {
+		return nil
+	}
+
+	mainFiles, err := activeMainFiles(mainDir)
+	if err != nil {
+		return err
+	}
 
 	log.Printf("[Fold] %s: full merge inc=%d main=%d", schema.Name, len(incFiles), len(mainFiles))
 
-	db, cleanup, err := openDuckDB(t.mainDir())
+	db, cleanup, err := openDuckDB(mainDir)
 	if err != nil {
 		return err
 	}
@@ -255,12 +241,28 @@ func (t *Table[T]) mergeFull(incFiles, mainFiles []string) error {
 		}
 	}
 
-	// Publish crash-safely: finish the staging file completely — including the
-	// bloom rewrite — validate it, then rename it into place, so the replacement
-	// only becomes visible once it is a complete file.
+	if err := t.publishMerged(db, mainDir, incFiles); err != nil {
+		return err
+	}
+
+	log.Printf("[Fold] %s: merge complete", schema.Name)
+	return nil
+}
+
+// publishMerged stages the DuckDB `result` table, finishes it completely
+// (bloom rewrite) before it becomes active, validates it, then atomically
+// publishes it as the partition's single active file via the manifest,
+// recording consumedInc so a retry never re-applies it. Bloom and validation
+// run on the staging file so a failure never publishes over live data.
+func (t *Table[T]) publishMerged(db *sql.DB, dir string, consumedInc []string) error {
 	ts := time.Now().UnixMilli()
-	tmpFile := filepath.Join(t.mainDir(), fmt.Sprintf(".merged_%d.parquet.tmp", ts))
-	finalFile := filepath.Join(t.mainDir(), fmt.Sprintf("merged_%d.parquet", ts))
+	filesDir := filepath.Join(dir, filesSubdir)
+	if err := os.MkdirAll(filesDir, 0755); err != nil {
+		return fmt.Errorf("create files dir: %w", err)
+	}
+	tmpFile := filepath.Join(filesDir, fmt.Sprintf(".merged_%d.parquet.tmp", ts))
+	finalRel := filepath.Join(filesSubdir, fmt.Sprintf("merged_%d.parquet", ts))
+	finalFile := filepath.Join(dir, finalRel)
 
 	if _, err := db.Exec(fmt.Sprintf(`COPY result TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3)`, tmpFile)); err != nil {
 		os.Remove(tmpFile)
@@ -268,7 +270,7 @@ func (t *Table[T]) mergeFull(incFiles, mainFiles []string) error {
 	}
 
 	// Bloom rewrite runs on the staging file, before it becomes active.
-	if err := addBloomFilters(tmpFile, schema); err != nil {
+	if err := addBloomFilters(tmpFile, t.schema); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("add bloom filters: %w", err)
 	}
@@ -280,21 +282,10 @@ func (t *Table[T]) mergeFull(incFiles, mainFiles []string) error {
 
 	if err := os.Rename(tmpFile, finalFile); err != nil {
 		os.Remove(tmpFile)
-		return err
+		return fmt.Errorf("publish result: %w", err)
 	}
 
-	// Clean up.
-	for _, f := range mainFiles {
-		if f != finalFile {
-			os.Remove(f)
-		}
-	}
-	for _, f := range incFiles {
-		os.Remove(f)
-	}
-
-	log.Printf("[Fold] %s: merge complete", schema.Name)
-	return nil
+	return commitActive(dir, []string{finalRel}, consumedInc)
 }
 
 // validateStagedParquet checks that a freshly written parquet file reads back

@@ -42,7 +42,18 @@ func (t *Table[T]) upsertFull(rows []map[string]any) error {
 	schema := t.schema
 	pkCols := schema.PKColumns()
 	mainDir := t.mainDir()
-	mainFiles := listParquetFiles(mainDir)
+
+	// Recover any inc consumed by a prior crashed merge before advancing the
+	// commit record, so its consumed-inc state is never stranded.
+	if err := recoverPartition(mainDir); err != nil {
+		return err
+	}
+
+	// Active main files come from the manifest, consistent with Merge.
+	mainFiles, err := activeMainFiles(mainDir)
+	if err != nil {
+		return err
+	}
 
 	// Write temporary Parquet.
 	tmpDir := filepath.Join(mainDir, fmt.Sprintf(".upsert_%d", time.Now().UnixNano()))
@@ -93,30 +104,8 @@ func (t *Table[T]) upsertFull(rows []map[string]any) error {
 		}
 	}
 
-	// Atomic write.
-	ts := time.Now().UnixMilli()
-	tmpOutFile := filepath.Join(mainDir, fmt.Sprintf(".merged_%d.parquet.tmp", ts))
-	finalFile := filepath.Join(mainDir, fmt.Sprintf("merged_%d.parquet", ts))
-
-	if _, err := db.Exec(fmt.Sprintf(`COPY result TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3)`, tmpOutFile)); err != nil {
-		os.Remove(tmpOutFile)
-		return fmt.Errorf("fold: upsert write result: %w", err)
-	}
-
-	if err := os.Rename(tmpOutFile, finalFile); err != nil {
-		os.Remove(tmpOutFile)
-		return err
-	}
-
-	if err := addBloomFilters(finalFile, schema); err != nil {
-		return fmt.Errorf("fold: upsert add bloom filters: %w", err)
-	}
-
-	// Delete old main files.
-	for _, f := range mainFiles {
-		if f != finalFile {
-			os.Remove(f)
-		}
+	if err := t.publishMerged(db, mainDir, nil); err != nil {
+		return fmt.Errorf("fold: upsert publish: %w", err)
 	}
 
 	log.Printf("[Fold] %s: upsert complete (%d records)", schema.Name, len(rows))
@@ -195,8 +184,18 @@ func (t *Table[T]) upsertOnePartition(partDir string, rows []map[string]any) err
 	pkCols := schema.PKColumns()
 
 	mainPartDir := filepath.Join(t.mainDir(), partDir)
-	mainPartFiles := listParquetFiles(mainPartDir)
 	os.MkdirAll(mainPartDir, 0755)
+
+	// Recover any inc consumed by a prior crashed merge before advancing the
+	// commit record, so its consumed-inc state is never stranded.
+	if err := recoverPartition(mainPartDir); err != nil {
+		return err
+	}
+
+	mainPartFiles, err := activeMainFiles(mainPartDir)
+	if err != nil {
+		return err
+	}
 
 	// Write temporary Parquet.
 	tmpDir := filepath.Join(mainPartDir, fmt.Sprintf(".upsert_%d", time.Now().UnixNano()))
@@ -246,22 +245,7 @@ func (t *Table[T]) upsertOnePartition(partDir string, rows []map[string]any) err
 		}
 	}
 
-	// Delete old main files.
-	for _, f := range mainPartFiles {
-		os.Remove(f)
-	}
-
-	ts := time.Now().UnixMilli()
-	outFile := filepath.Join(mainPartDir, fmt.Sprintf("merged_%d.parquet", ts))
-	if _, err := db.Exec(fmt.Sprintf(`COPY result TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3)`, outFile)); err != nil {
-		return fmt.Errorf("write result: %w", err)
-	}
-
-	if err := addBloomFilters(outFile, schema); err != nil {
-		return fmt.Errorf("add bloom filters: %w", err)
-	}
-
-	return nil
+	return t.publishMerged(db, mainPartDir, nil)
 }
 
 // convertRawRecords converts RawRecord rows into the map form used by writeParquet.
