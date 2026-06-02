@@ -13,16 +13,23 @@ import (
 // Fold tracks the active state of a partition directory with two small JSON
 // files, so a crash or retry can never lose data or re-apply an inc batch:
 //
-//	_manifest.json   the current read set: which parquet files are active now
+//	_manifest.json    the current read set: which parquet files are active now
 //	_commit_<tx>.json the inputs consumed and outputs produced by that commit
 //
 // The manifest swap (an atomic rename) is the single commit point. Reads use
-// the manifest's active file list rather than a directory glob, so files left
-// behind by an interrupted publish are ignored and later garbage-collected.
+// the manifest's active file list rather than a directory glob.
+//
+// Publish outputs are written under a files/ subdirectory; the top level of a
+// partition directory holds only metadata (and any pre-manifest "legacy" data
+// being migrated). That separation is what lets recovery tell a genuine
+// pre-existing file (top level) apart from an output left behind by a publish
+// that crashed before committing (under files/, never adopted until a manifest
+// references it).
 const (
 	manifestName = "_manifest.json"
 	commitPrefix = "_commit_"
 	commitSuffix = ".json"
+	filesSubdir  = "files"
 )
 
 // partitionManifest is the source of truth for a partition's active main files.
@@ -30,7 +37,7 @@ const (
 // at the commit that produced them. It does not keep historical batch state.
 type partitionManifest struct {
 	Version     int      `json:"version"`
-	ActiveFiles []string `json:"active_files"` // basenames within the partition dir
+	ActiveFiles []string `json:"active_files"` // paths relative to the partition dir
 	LastCommit  string   `json:"last_commit"`  // tx id of the commit that produced ActiveFiles
 }
 
@@ -41,7 +48,7 @@ type partitionManifest struct {
 type commitRecord struct {
 	TxID        string   `json:"tx_id"`
 	InputFiles  []string `json:"input_files"`  // absolute inc paths consumed by this commit
-	OutputFiles []string `json:"output_files"` // basenames published into the partition dir
+	OutputFiles []string `json:"output_files"` // paths relative to the partition dir
 }
 
 func manifestPath(dir string) string     { return filepath.Join(dir, manifestName) }
@@ -99,17 +106,18 @@ func writeJSONAtomic(path string, v any) error {
 	return nil
 }
 
-// activeMainFiles returns the absolute paths of a partition's active main files.
-// It prefers the manifest; with no manifest yet (data written by an earlier
-// version, or the first publish), it adopts the parquet files already present,
-// migrating that directory into manifest control on the next commit.
+// activeMainFiles returns the absolute paths of a partition's active main files,
+// always from the manifest. recoverPartition installs a manifest before any
+// publish, so a directory reaching a publish has one; an output left behind by
+// an interrupted publish is therefore never adopted here — only a committed
+// manifest makes a file active.
 func activeMainFiles(dir string) ([]string, error) {
 	m, err := readManifest(dir)
 	if err != nil {
 		return nil, err
 	}
 	if m == nil {
-		return listParquetFiles(dir), nil
+		return nil, nil
 	}
 	files := make([]string, 0, len(m.ActiveFiles))
 	for _, name := range m.ActiveFiles {
@@ -118,19 +126,22 @@ func activeMainFiles(dir string) ([]string, error) {
 	return files, nil
 }
 
-// recoverPartition completes any cleanup that an interrupted publish skipped: it
-// deletes inc files already consumed by the last commit (so a retry never
-// re-applies them) and removes superseded or orphaned files left in the
-// directory. It is a no-op on a clean directory. Running it before every
-// publish — merge and upsert alike — guarantees that a commit advancing
-// last_commit never strands the previous commit's consumed-inc inputs.
+// recoverPartition completes any cleanup that an interrupted publish skipped and
+// guarantees a manifest exists. It is a no-op on a clean directory, and is run
+// before every publish — merge and upsert alike.
 func recoverPartition(dir string) error {
 	m, err := readManifest(dir)
 	if err != nil {
 		return err
 	}
 	if m == nil {
-		return nil
+		// First publish, or migration of a pre-manifest directory: adopt only the
+		// legacy parquet files at the top level as the initial active set and
+		// install a manifest. Publish outputs live under files/, so this runs
+		// before any new output is adoptable: an output left by a later publish
+		// that crashes before committing is under files/ and is never mistaken
+		// for active data — the retry finds the manifest and cleans it instead.
+		return writeJSONAtomic(manifestPath(dir), partitionManifest{ActiveFiles: legacyTopLevelFiles(dir)})
 	}
 	if c, err := readCommit(dir, m.LastCommit); err != nil {
 		return err
@@ -145,21 +156,18 @@ func recoverPartition(dir string) error {
 			}
 		}
 	}
-	active := make([]string, len(m.ActiveFiles))
-	for i, name := range m.ActiveFiles {
-		active[i] = filepath.Join(dir, name)
-	}
-	finalizeDir(dir, active, m.LastCommit)
+	finalizeDir(dir, m.ActiveFiles, m.LastCommit)
 	return nil
 }
 
-// commitActive atomically publishes newActive as the partition's active file
-// set and records the consumed inc inputs. Writing the commit record first and
-// then renaming the manifest makes the manifest swap the single commit point: a
-// crash before it leaves the old state authoritative (the new output is an
-// ignored orphan), a crash after it leaves the new state authoritative (the
-// consumed inc are recorded so they are never re-applied). Superseded/orphaned
-// files, consumed inc, and stale commit records are then garbage-collected.
+// commitActive atomically publishes newActive (paths relative to dir) as the
+// partition's active file set and records the consumed inc inputs. Writing the
+// commit record first and then renaming the manifest makes the manifest swap the
+// single commit point: a crash before it leaves the old state authoritative (the
+// new output is an ignored orphan under files/), a crash after it leaves the new
+// state authoritative (the consumed inc are recorded so they are never
+// re-applied). Superseded/orphaned files, consumed inc, and stale commit records
+// are then garbage-collected.
 func commitActive(dir string, newActive, consumedInc []string) error {
 	prev, err := readManifest(dir)
 	if err != nil {
@@ -171,12 +179,12 @@ func commitActive(dir string, newActive, consumedInc []string) error {
 	}
 	txID := uuid.New().String()
 
-	rec := commitRecord{TxID: txID, InputFiles: consumedInc, OutputFiles: baseNames(newActive)}
+	rec := commitRecord{TxID: txID, InputFiles: consumedInc, OutputFiles: newActive}
 	if err := writeJSONAtomic(commitPath(dir, txID), rec); err != nil {
 		return fmt.Errorf("write commit record: %w", err)
 	}
 
-	m := partitionManifest{Version: version, ActiveFiles: baseNames(newActive), LastCommit: txID}
+	m := partitionManifest{Version: version, ActiveFiles: newActive, LastCommit: txID}
 	if err := writeJSONAtomic(manifestPath(dir), m); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}
@@ -190,36 +198,47 @@ func commitActive(dir string, newActive, consumedInc []string) error {
 }
 
 // finalizeDir removes everything in a published partition directory that is not
-// part of the current commit: parquet files no longer active (superseded or
-// orphaned by an interrupted publish), stray staging temp files, and commit
-// records other than keepTx.
+// part of the current commit: parquet files no longer active (superseded
+// legacy files, or outputs orphaned by an interrupted publish), stray staging
+// temp files, and commit records other than keepTx. active holds paths relative
+// to dir.
 func finalizeDir(dir string, active []string, keepTx string) {
 	keep := make(map[string]bool, len(active))
 	for _, a := range active {
-		keep[filepath.Base(a)] = true
+		keep[a] = true
 	}
 	keepCommit := commitPrefix + keepTx + commitSuffix
-	entries, _ := os.ReadDir(dir)
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
 		}
-		name := e.Name()
+		name := info.Name()
+		rel, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			return nil
+		}
 		switch {
 		case strings.HasSuffix(name, ".tmp"):
-			os.Remove(filepath.Join(dir, name))
-		case strings.HasSuffix(name, ".parquet") && !keep[name]:
-			os.Remove(filepath.Join(dir, name))
-		case strings.HasPrefix(name, commitPrefix) && strings.HasSuffix(name, commitSuffix) && name != keepCommit:
-			os.Remove(filepath.Join(dir, name))
+			os.Remove(path)
+		case strings.HasSuffix(name, ".parquet") && !keep[rel]:
+			os.Remove(path)
+		case filepath.Dir(rel) == "." && strings.HasPrefix(name, commitPrefix) && strings.HasSuffix(name, commitSuffix) && name != keepCommit:
+			os.Remove(path)
 		}
-	}
+		return nil
+	})
 }
 
-func baseNames(paths []string) []string {
-	out := make([]string, len(paths))
-	for i, p := range paths {
-		out[i] = filepath.Base(p)
+// legacyTopLevelFiles lists parquet files directly under dir (not under files/),
+// i.e. data written by a pre-manifest version. Publish outputs live under
+// files/, so they are never mistaken for legacy data here.
+func legacyTopLevelFiles(dir string) []string {
+	var names []string
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if !e.IsDir() && !strings.HasPrefix(e.Name(), ".") && strings.HasSuffix(e.Name(), ".parquet") {
+			names = append(names, e.Name())
+		}
 	}
-	return out
+	return names
 }

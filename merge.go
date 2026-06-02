@@ -256,8 +256,13 @@ func (t *Table[T]) mergeFull() error {
 // run on the staging file so a failure never publishes over live data.
 func (t *Table[T]) publishMerged(db *sql.DB, dir string, consumedInc []string) error {
 	ts := time.Now().UnixMilli()
-	tmpFile := filepath.Join(dir, fmt.Sprintf(".merged_%d.parquet.tmp", ts))
-	finalFile := filepath.Join(dir, fmt.Sprintf("merged_%d.parquet", ts))
+	filesDir := filepath.Join(dir, filesSubdir)
+	if err := os.MkdirAll(filesDir, 0755); err != nil {
+		return fmt.Errorf("create files dir: %w", err)
+	}
+	tmpFile := filepath.Join(filesDir, fmt.Sprintf(".merged_%d.parquet.tmp", ts))
+	finalRel := filepath.Join(filesSubdir, fmt.Sprintf("merged_%d.parquet", ts))
+	finalFile := filepath.Join(dir, finalRel)
 
 	if _, err := db.Exec(fmt.Sprintf(`COPY result TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3)`, tmpFile)); err != nil {
 		os.Remove(tmpFile)
@@ -280,7 +285,7 @@ func (t *Table[T]) publishMerged(db *sql.DB, dir string, consumedInc []string) e
 		return fmt.Errorf("publish result: %w", err)
 	}
 
-	return commitActive(dir, []string{finalFile}, consumedInc)
+	return commitActive(dir, []string{finalRel}, consumedInc)
 }
 
 // validateStagedParquet checks that a freshly written parquet file reads back

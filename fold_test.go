@@ -1029,3 +1029,63 @@ func TestRecoveryErrorsWhenConsumedIncCannotBeRemoved(t *testing.T) {
 		t.Fatalf("manifest advanced despite recovery failure: before=%+v after=%+v", before, after)
 	}
 }
+
+// TestMergeIgnoresUncommittedFirstPublishOutput covers a first publish that
+// crashed after writing its output but before committing: the output sits in
+// the publish location (files/) with no manifest yet. The retry must treat the
+// still-present inc as the only authoritative state — not adopt the orphan and
+// re-apply inc — and must garbage-collect the orphan.
+func TestMergeIgnoresUncommittedFirstPublishOutput(t *testing.T) {
+	// Build a real parquet (total=99) to stand in for the uncommitted output.
+	srcDB, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open src: %v", err)
+	}
+	defer srcDB.Close()
+	src := Register[MergeRow](srcDB)
+	if err := src.Import("s", []MergeRow{{ID: "x", Total: 99}}); err != nil {
+		t.Fatalf("src import: %v", err)
+	}
+	if err := src.Merge(); err != nil {
+		t.Fatalf("src merge: %v", err)
+	}
+	srcFiles := listParquetFiles(src.mainDir())
+	if len(srcFiles) != 1 {
+		t.Fatalf("src produced %d files", len(srcFiles))
+	}
+	orphanBytes, err := os.ReadFile(srcFiles[0])
+	if err != nil {
+		t.Fatalf("read src output: %v", err)
+	}
+
+	// Subject table: inc live (total=5), an uncommitted output in files/, no
+	// manifest/commit metadata yet.
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+	if err := table.Import("b", []MergeRow{{ID: "x", Total: 5}}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	filesDir := filepath.Join(table.mainDir(), filesSubdir)
+	if err := os.MkdirAll(filesDir, 0755); err != nil {
+		t.Fatalf("mkdir files: %v", err)
+	}
+	orphan := filepath.Join(filesDir, "merged_orphan.parquet")
+	if err := os.WriteFile(orphan, orphanBytes, 0644); err != nil {
+		t.Fatalf("write orphan: %v", err)
+	}
+
+	if err := table.Merge(); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	if got := queryTotal(t, table.mainDir(), "x"); got != 5 {
+		t.Fatalf("uncommitted output adopted (inc re-applied): total=%d, want 5", got)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatal("uncommitted output was not garbage-collected")
+	}
+}
