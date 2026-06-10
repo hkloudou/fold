@@ -2,9 +2,11 @@ package fold
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Object is a stored item returned by Storage.List.
@@ -22,9 +24,15 @@ type WriteOptions struct{}
 // immutable object movement, listing, and deletion. It deliberately does not
 // model streaming bulk I/O — DuckDB reads and writes Parquet in a local
 // workspace, and Storage publishes the staged files plus the manifest. The
-// local filesystem implementation is the default; an object-storage adapter can
-// implement the same contract (stage locally, then UploadFile + WriteJSON,
-// swapping the manifest as the commit point).
+// local filesystem implementation is the default; an object-storage adapter
+// (for example the Aliyun OSS adapter in github.com/hkloudou/fold/oss)
+// implements the same contract: stage locally, then UploadFile + WriteJSON,
+// swapping the manifest as the commit point. When the storage is not the
+// built-in local backend, Fold fetches a partition's active main files into
+// the local workspace through DownloadFile before DuckDB reads them.
+//
+// The inc/ area is always part of the local workspace and is never persisted
+// through Storage; only main/ metadata and published outputs go through it.
 type Storage interface {
 	// List returns every object whose path is under prefix (recursive).
 	List(prefix string) ([]Object, error)
@@ -45,6 +53,37 @@ type Storage interface {
 // localStorage implements Storage on the local filesystem, operating directly on
 // the paths Fold computes. Writes are atomic (temp file + rename).
 type localStorage struct{}
+
+// isLocalStorage reports whether st is the built-in local filesystem backend,
+// whose object paths DuckDB can read in place without a download step.
+func isLocalStorage(st Storage) bool {
+	_, ok := st.(localStorage)
+	return ok
+}
+
+// localizeMainFiles makes a partition's active main files readable by DuckDB.
+// For the local backend the manifest paths already are local files. For any
+// other backend the objects are fetched through DownloadFile into a temporary
+// fetch directory under dir; the returned cleanup removes it. cleanup is never
+// nil and is safe to call on the error path too.
+func localizeMainFiles(st Storage, dir string, files []string) ([]string, func(), error) {
+	noop := func() {}
+	if len(files) == 0 || isLocalStorage(st) {
+		return files, noop, nil
+	}
+	fetchDir := filepath.Join(dir, fmt.Sprintf(".fetch_%d", time.Now().UnixNano()))
+	cleanup := func() { os.RemoveAll(fetchDir) }
+	local := make([]string, len(files))
+	for i, f := range files {
+		lp := filepath.Join(fetchDir, fmt.Sprintf("main_%d.parquet", i))
+		if err := st.DownloadFile(f, lp); err != nil {
+			cleanup()
+			return nil, noop, fmt.Errorf("download main file %s: %w", f, err)
+		}
+		local[i] = lp
+	}
+	return local, cleanup, nil
+}
 
 func (localStorage) List(prefix string) ([]Object, error) {
 	var objs []Object

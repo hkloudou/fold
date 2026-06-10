@@ -3,6 +3,7 @@ module github.com/hkloudou/fold
 go 1.24.4
 
 require (
+	github.com/aliyun/alibabacloud-oss-go-sdk-v2 v1.5.1
 	github.com/apache/arrow-go/v18 v18.5.1
 	github.com/google/uuid v1.6.0
 	github.com/marcboeker/go-duckdb/v2 v2.4.3
@@ -48,6 +49,7 @@ require (
 	golang.org/x/sys v0.40.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260109210033-bd525da824e2 // indirect
 	golang.org/x/text v0.33.0 // indirect
+	golang.org/x/time v0.4.0 // indirect
 	golang.org/x/tools v0.41.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251029180050-ab9386a59fda // indirect
