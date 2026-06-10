@@ -70,10 +70,11 @@ type Config struct {
 
 // Storage implements fold.Storage on an Aliyun OSS bucket.
 type Storage struct {
-	client *aliyun.Client
-	bucket string
-	root   string
-	prefix string
+	client   *aliyun.Client
+	uploader *aliyun.Uploader
+	bucket   string
+	root     string
+	prefix   string
 }
 
 var _ fold.Storage = (*Storage)(nil)
@@ -108,12 +109,19 @@ func New(cfg Config) (*Storage, error) {
 // NewFromClient wraps an existing OSS SDK client. localRoot must be the
 // directory passed to fold.Open; prefix (optional) is prepended to every key.
 func NewFromClient(client *aliyun.Client, bucket, localRoot, prefix string) *Storage {
-	return &Storage{
+	s := &Storage{
 		client: client,
 		bucket: bucket,
 		root:   filepath.Clean(localRoot),
 		prefix: strings.Trim(prefix, "/"),
 	}
+	if client != nil {
+		// The uploader switches to multipart upload for files beyond its part
+		// size, so published segments are not capped by the 5 GiB single-PUT
+		// limit of PutObject.
+		s.uploader = client.NewUploader()
+	}
+	return s
 }
 
 // keyFor maps a Fold path under the local root to an object key.
@@ -215,12 +223,14 @@ func (s *Storage) WriteJSON(p string, src any, _ fold.WriteOptions) error {
 
 // UploadFile publishes a finished local file to dst and removes the local
 // staging copy on success, mirroring the local backend's rename semantics.
+// Uploads go through the SDK uploader, which uses multipart upload for large
+// files, so merged segments are not capped by the 5 GiB single-PUT limit.
 func (s *Storage) UploadFile(localPath, dst string) error {
 	key, err := s.keyFor(dst)
 	if err != nil {
 		return err
 	}
-	_, err = s.client.PutObjectFromFile(context.Background(), &aliyun.PutObjectRequest{
+	_, err = s.uploader.UploadFile(context.Background(), &aliyun.PutObjectRequest{
 		Bucket: aliyun.Ptr(s.bucket),
 		Key:    aliyun.Ptr(key),
 	}, localPath)
