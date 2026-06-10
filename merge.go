@@ -161,8 +161,13 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 	}
 
 	if len(mainPartFiles) > 0 {
+		localMain, cleanupMain, err := localizeMainFiles(t.db.storage, mainPartDir, mainPartFiles)
+		if err != nil {
+			return err
+		}
+		defer cleanupMain()
 		incMergedCols := queryTableColumns(db, "inc_merged")
-		mainGlob := buildFileList(mainPartFiles)
+		mainGlob := buildFileList(localMain)
 		if _, err := db.Exec(fmt.Sprintf(`CREATE VIEW main_view AS SELECT * FROM read_parquet([%s], union_by_name=true)`, mainGlob)); err != nil {
 			return fmt.Errorf("read main: %w", err)
 		}
@@ -223,8 +228,13 @@ func (t *Table[T]) mergeFull() error {
 	}
 
 	if len(mainFiles) > 0 {
+		localMain, cleanupMain, err := localizeMainFiles(t.db.storage, mainDir, mainFiles)
+		if err != nil {
+			return err
+		}
+		defer cleanupMain()
 		incMergedCols := queryTableColumns(db, "inc_merged")
-		mainGlob := buildFileList(mainFiles)
+		mainGlob := buildFileList(localMain)
 		if _, err := db.Exec(fmt.Sprintf(`CREATE VIEW main_view AS SELECT * FROM read_parquet([%s], union_by_name=true)`, mainGlob)); err != nil {
 			return fmt.Errorf("read main: %w", err)
 		}
@@ -262,7 +272,7 @@ func (t *Table[T]) publishMerged(db *sql.DB, dir string, consumedInc []string) e
 	finalRel := filepath.Join(filesSubdir, fmt.Sprintf("merged_%d.parquet", ts))
 	finalFile := filepath.Join(dir, finalRel)
 
-	if _, err := db.Exec(fmt.Sprintf(`COPY result TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3)`, tmpFile)); err != nil {
+	if _, err := db.Exec(fmt.Sprintf(`COPY result TO %s (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3)`, sqlQuote(tmpFile))); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("write result: %w", err)
 	}
@@ -322,7 +332,7 @@ func validateStagedParquet(db *sql.DB, path string) error {
 	if err := db.QueryRow(`SELECT count(*) FROM result`).Scan(&resultRows); err != nil {
 		return fmt.Errorf("count result: %w", err)
 	}
-	if err := db.QueryRow(fmt.Sprintf(`SELECT count(*) FROM read_parquet('%s')`, path)).Scan(&fileRows); err != nil {
+	if err := db.QueryRow(fmt.Sprintf(`SELECT count(*) FROM read_parquet(%s)`, sqlQuote(path))).Scan(&fileRows); err != nil {
 		return fmt.Errorf("count staged file: %w", err)
 	}
 	if resultRows != fileRows {
@@ -503,10 +513,16 @@ func listParquetFiles(dir string) []string {
 	return files
 }
 
+// sqlQuote single-quotes a string for interpolation into DuckDB SQL, escaping
+// embedded quotes so paths containing ' cannot break the statement.
+func sqlQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
 func buildFileList(files []string) string {
 	quoted := make([]string, len(files))
 	for i, f := range files {
-		quoted[i] = "'" + f + "'"
+		quoted[i] = sqlQuote(f)
 	}
 	return strings.Join(quoted, ", ")
 }

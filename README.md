@@ -11,9 +11,10 @@ stable `main/` Parquet files using merge strategies declared on Go struct tags.
 
 Fold runs on the local filesystem with crash-safe, retry-idempotent,
 manifest-backed merges, streaming import, and configurable resource bounds. An
-object-storage adapter (and direct DuckDB `s3://` / `httpfs` I/O), LSM-style
-levels, and a scheduler are deliberately deferred — the `Storage` seam is in
-place so a remote backend can be added later without changing the merge model.
+Aliyun OSS backend is available in `github.com/hkloudou/fold/oss`: manifests
+and published Parquet segments live in the bucket while `inc/` and DuckDB
+staging stay on the local disk. Direct DuckDB `s3://` / `httpfs` I/O,
+LSM-style levels, and a scheduler are deliberately deferred.
 
 ## Install
 
@@ -217,6 +218,45 @@ an adapter can target another backend by staging locally then publishing:
 ```go
 db, _ := fold.Open("./data", fold.WithStorage(myStorage))
 ```
+
+With a non-local backend, Fold fetches a partition's active main files through
+`Storage.DownloadFile` into the local workspace before DuckDB reads them, and
+publishes staged outputs with `Storage.UploadFile`. The `inc/` area always
+stays on the local disk; only `main/` metadata and published segments go
+through the backend. Fold assumes a single writer per table — object writes
+are atomic, but concurrent writers on different machines are not coordinated.
+
+### Aliyun OSS
+
+The `github.com/hkloudou/fold/oss` package implements `Storage` on an Aliyun
+OSS bucket:
+
+```go
+import (
+	"github.com/hkloudou/fold"
+	foldoss "github.com/hkloudou/fold/oss"
+)
+
+st, err := foldoss.New(foldoss.Config{
+	Region:          "cn-hangzhou",
+	Bucket:          "my-bucket",
+	AccessKeyID:     os.Getenv("OSS_ACCESS_KEY_ID"),
+	AccessKeySecret: os.Getenv("OSS_ACCESS_KEY_SECRET"),
+	Prefix:          "fold",    // optional key prefix inside the bucket
+	LocalRoot:       "./data",  // must equal the dir passed to fold.Open
+})
+if err != nil {
+	panic(err)
+}
+db, _ := fold.Open("./data", fold.WithStorage(st))
+```
+
+Leave `AccessKeyID`/`AccessKeySecret` empty to use the SDK's environment
+credentials (`OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` /
+`OSS_SESSION_TOKEN`), or build a custom `*oss.Client` (VPC endpoint, STS,
+ECS RAM role, …) and wrap it with `foldoss.NewFromClient`. `LocalRoot` is the
+part of every path that is stripped before the remainder becomes the object
+key, so the bucket layout mirrors the local `main/` layout under `Prefix`.
 
 ## Readers
 

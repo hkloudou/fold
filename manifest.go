@@ -155,8 +155,10 @@ func recoverPartition(st Storage, dir string) error {
 			// Removal must succeed before a new publish may advance last_commit.
 			// The commit record is the only record of these consumed inputs; if
 			// it were GC'd while the inc files survived, a later merge would
-			// re-apply them. Delete already tolerates an absent file.
-			if err := st.Delete(f); err != nil {
+			// re-apply them. Consumed inc always lives in the local workspace,
+			// never behind a remote Storage, so it is removed locally. Delete
+			// already tolerates an absent file.
+			if err := (localStorage{}).Delete(f); err != nil {
 				return fmt.Errorf("recover consumed inc %s: %w", f, err)
 			}
 		}
@@ -197,8 +199,9 @@ func commitActive(st Storage, dir string, newActive, consumedInc []string) error
 	if err := finalizeDir(st, dir, newActive, txID); err != nil {
 		return err
 	}
+	// Consumed inc lives in the local workspace, never behind a remote Storage.
 	for _, f := range consumedInc {
-		st.Delete(f)
+		localStorage{}.Delete(f)
 	}
 	return nil
 }

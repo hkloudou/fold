@@ -88,8 +88,13 @@ func (t *Table[T]) upsertFull(rows []map[string]any) error {
 	}
 
 	if len(mainFiles) > 0 {
+		localMain, cleanupMain, err := localizeMainFiles(t.db.storage, mainDir, mainFiles)
+		if err != nil {
+			return err
+		}
+		defer cleanupMain()
 		incMergedCols := queryTableColumns(db, "inc_merged")
-		mainGlob := buildFileList(mainFiles)
+		mainGlob := buildFileList(localMain)
 		if _, err := db.Exec(fmt.Sprintf(`CREATE VIEW main_view AS SELECT * FROM read_parquet([%s], union_by_name=true)`, mainGlob)); err != nil {
 			return fmt.Errorf("fold: upsert read main: %w", err)
 		}
@@ -229,8 +234,13 @@ func (t *Table[T]) upsertOnePartition(partDir string, rows []map[string]any) err
 	}
 
 	if len(mainPartFiles) > 0 {
+		localMain, cleanupMain, err := localizeMainFiles(t.db.storage, mainPartDir, mainPartFiles)
+		if err != nil {
+			return err
+		}
+		defer cleanupMain()
 		incMergedCols := queryTableColumns(db, "inc_merged")
-		mainGlob := buildFileList(mainPartFiles)
+		mainGlob := buildFileList(localMain)
 		if _, err := db.Exec(fmt.Sprintf(`CREATE VIEW main_view AS SELECT * FROM read_parquet([%s], union_by_name=true)`, mainGlob)); err != nil {
 			return fmt.Errorf("read main: %w", err)
 		}
