@@ -75,16 +75,47 @@ func extractRow(schema *Schema, rec any) (map[string]any, bool, error) {
 }
 
 // partitionDirFor returns the partition subdirectory for a row, or "" when the
-// table is unpartitioned.
+// table is unpartitioned. Values are percent-encoded so a value containing a
+// path separator can neither escape the table directory nor create nesting
+// that discoverPartitions would never match (stranding the data unmerged).
 func partitionDirFor(row map[string]any, schema *Schema) string {
 	if len(schema.Partitions) == 0 {
 		return ""
 	}
 	parts := make([]string, 0, len(schema.Partitions))
 	for _, p := range schema.Partitions {
-		parts = append(parts, fmt.Sprintf("%s=%s", p.Key, evalPartition(row, p, schema)))
+		parts = append(parts, fmt.Sprintf("%s=%s", p.Key, encodePartitionValue(evalPartition(row, p, schema))))
 	}
 	return filepath.Join(parts...)
+}
+
+// encodePartitionValue percent-encodes the bytes that would break the
+// key=value directory scheme: path separators, '%' itself, and control
+// bytes. Typical values (letters, digits, CJK, '-', '_', '=') pass through
+// unchanged, so existing well-formed layouts keep their directory names.
+func encodePartitionValue(s string) string {
+	needsEscape := func(c byte) bool {
+		return c == '%' || c == '/' || c == '\\' || c < 0x20 || c == 0x7f
+	}
+	clean := true
+	for i := 0; i < len(s); i++ {
+		if needsEscape(s[i]) {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; needsEscape(c) {
+			fmt.Fprintf(&b, "%%%02X", c)
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // groupByPartitions groups rows by partition rules.
@@ -147,7 +178,12 @@ func writeParquet(dir string, schema *Schema, rows []map[string]any) error {
 		return err
 	}
 
+	// Stage to a .tmp name and rename on success: a crash mid-write must not
+	// leave a truncated .parquet that every later merge would read and fail
+	// on. Readers skip the .parquet.tmp suffix; a crash leftover is removed by
+	// merge's cleanIncLeftovers once it is stale.
 	outPath := filepath.Join(dir, uuid.New().String()+".parquet")
+	tmpPath := outPath + ".tmp"
 
 	// Build the Arrow schema.
 	arrowFields := make([]arrow.Field, len(schema.Fields))
@@ -183,12 +219,19 @@ func writeParquet(dir string, schema *Schema, rows []map[string]any) error {
 	record := array.NewRecord(arrowSchema, arrays, int64(len(rows)))
 	defer record.Release()
 
-	// Write Parquet.
-	outFile, err := os.Create(outPath)
+	// Write Parquet. A concurrent merge's cleanIncLeftovers may remove the
+	// partition directory in the window between MkdirAll above and this
+	// create (it only removes empty dirs), so recreate and retry on ENOENT.
+	outFile, err := os.Create(tmpPath)
+	for retries := 0; os.IsNotExist(err) && retries < 3; retries++ {
+		if mkErr := os.MkdirAll(dir, 0755); mkErr != nil {
+			return mkErr
+		}
+		outFile, err = os.Create(tmpPath)
+	}
 	if err != nil {
 		return err
 	}
-	defer outFile.Close()
 
 	// Writer properties: Zstd compression and bloom filters.
 	writerOpts := []parquet.WriterProperty{
@@ -205,15 +248,29 @@ func writeParquet(dir string, schema *Schema, rows []map[string]any) error {
 
 	writer, err := pqarrow.NewFileWriter(arrowSchema, outFile, writerProps, arrowProps)
 	if err != nil {
+		outFile.Close()
+		os.Remove(tmpPath)
 		return err
 	}
 
 	if err := writer.Write(record); err != nil {
 		writer.Close()
+		os.Remove(tmpPath)
 		return err
 	}
 
-	return writer.Close()
+	// writer.Close writes the footer and closes outFile (the parquet writer
+	// closes its sink), so the staged file is closed before the rename — a
+	// rename of an open file fails on Windows.
+	if err := writer.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, outPath); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 // buildArrowField builds an Arrow field from Fold field metadata.
@@ -280,32 +337,6 @@ func appendValue(builder array.Builder, f Field, val any) {
 			}
 		}
 	}
-}
-
-// partitionExprToSQL converts a partition rule into a DuckDB SQL expression.
-func partitionExprToSQL(p PartitionRule, schema *Schema) string {
-	col := ""
-	for _, f := range schema.Fields {
-		if f.GoName == p.Field {
-			col = f.Column
-			break
-		}
-	}
-	if col == "" {
-		return "''"
-	}
-
-	if p.Hash > 0 {
-		return fmt.Sprintf("printf('%%02x', hash(%s) %% %d)", col, p.Hash)
-	}
-
-	if p.Slice != [2]int{0, 0} {
-		start := p.Slice[0]
-		length := p.Slice[1] - p.Slice[0]
-		return fmt.Sprintf("substr(%s, %d, %d)", col, start+1, length)
-	}
-
-	return col
 }
 
 // addBloomFilters rewrites a DuckDB-produced Parquet file with Arrow bloom filters.
@@ -393,16 +424,4 @@ func addBloomFilters(path string, schema *Schema) error {
 	}
 
 	return os.Rename(tmpPath, path)
-}
-
-// partitionDirSQL builds the full partition directory SQL expression.
-func partitionDirSQL(schema *Schema) string {
-	if len(schema.Partitions) == 0 {
-		return ""
-	}
-	var parts []string
-	for _, p := range schema.Partitions {
-		parts = append(parts, fmt.Sprintf("'%s=' || %s", p.Key, partitionExprToSQL(p, schema)))
-	}
-	return strings.Join(parts, " || '/' || ")
 }

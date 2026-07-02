@@ -47,8 +47,25 @@ type partitionBuffer struct {
 	bytes int64
 }
 
-// NewImportWriter creates a streaming import writer for a source.
+// NewImportWriter creates a streaming import writer for a source. The source
+// becomes one directory level under inc/<table>/, so it is percent-encoded
+// like a partition value: a separator in it ("2026/07/02", "../x") would
+// otherwise write outside the source level — escaping the data root or
+// stranding the batch where merge never collects it. An empty source is
+// replaced with "default" for the same reason.
 func (t *Table[T]) NewImportWriter(source string, opts ImportOptions) *ImportWriter[T] {
+	source = encodePartitionValue(source)
+	switch source {
+	case "":
+		source = "default"
+	case ".":
+		// filepath.Join elides "." (dropping the source level merge expects)
+		// and collapses ".." (escaping inc/<table>), so encode bare dot
+		// segments the same way separators are encoded.
+		source = "%2E"
+	case "..":
+		source = "%2E%2E"
+	}
 	return &ImportWriter[T]{
 		table:  t,
 		source: source,

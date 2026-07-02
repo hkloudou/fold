@@ -134,10 +134,16 @@ func parseSchema[T any]() (*Schema, error) {
 		}
 
 		schema.Fields = append(schema.Fields, *field)
-		if field.Strategy == StrategyPK {
-			schema.PKs = append(schema.PKs, &schema.Fields[len(schema.Fields)-1])
-		}
 		schema.Partitions = append(schema.Partitions, field.Partition...)
+	}
+
+	// Collect PK pointers only after Fields stops growing: appending can
+	// reallocate the backing array, which would leave earlier-taken pointers
+	// aimed at the stale copy.
+	for i := range schema.Fields {
+		if schema.Fields[i].Strategy == StrategyPK {
+			schema.PKs = append(schema.PKs, &schema.Fields[i])
+		}
 	}
 
 	if len(schema.PKs) == 0 {

@@ -127,6 +127,28 @@ Declare strategies with the `bd` struct tag.
 | `sum` | Add values together. |
 | `expr:SQL;agg:SQL` | Provide custom DuckDB SQL for merge and inc pre-aggregation. |
 
+### Partition and source directory names are percent-encoded
+
+Partition values and the `Import` source become directory names, so bytes that
+would break the `key=value` layout — `/`, `\`, `%`, control characters — are
+percent-encoded (`hua/dong` → `area=hua%2Fdong`). Typical values (letters,
+digits, CJK, `-`, `_`) are unchanged. **Upgrade note:** datasets written by
+older versions with raw `%` or `\` in a partition directory name keep working
+for reads, but new imports of the same logical value will target the encoded
+directory name. Rename such directories to their encoded form (or re-import
+into a fresh dataset) before mixing old and new writers, so one primary key
+does not end up active in two partition directories.
+
+### Zero values are treated as absent
+
+`Import` and `Upsert` skip a field whose value is the Go zero value (`""`,
+`0`, empty slice): the column is simply not written for that row, so merge
+strategies see it as "no new information" and keep the existing value. This is
+what makes partial records safe to import, but it also means an explicit `0`
+or `""` cannot overwrite a previously stored value. Model resettable fields so
+their zero is never meaningful (e.g. store a sentinel, or use `json_merge`
+with an explicit `null` to delete a key per RFC 7396).
+
 ### json_merge conflict contract
 
 `json_merge` follows RFC 7396 JSON Merge Patch. Non-conflicting keys are always

@@ -88,7 +88,7 @@ func (t *Table[T]) mergePartitioned(incFiles []string) error {
 		}
 	}
 
-	cleanEmptyDirs(t.incDir())
+	cleanIncLeftovers(t.incDir())
 
 	if len(errs) > 0 {
 		return fmt.Errorf("some partitions failed: %s", strings.Join(errs, "; "))
@@ -110,6 +110,9 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 
 	mainPartDir := filepath.Join(t.mainDir(), partDir)
 	os.MkdirAll(mainPartDir, 0755)
+
+	// Serialize with any concurrent publish (merge or upsert) on this partition.
+	defer t.db.lockPartition(mainPartDir)()
 
 	// Complete any cleanup an interrupted publish skipped (delete already-consumed
 	// inc, remove superseded/orphaned files) before reading the partition.
@@ -152,7 +155,10 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 	}
 
 	// Detect actual columns.
-	incCols := queryTableColumns(db, "inc_data")
+	incCols, err := queryTableColumns(db, "inc_data")
+	if err != nil {
+		return err
+	}
 	activeFields := filterActiveFields(schema.Fields, incCols)
 
 	// Pre-merge inc rows.
@@ -166,12 +172,18 @@ func (t *Table[T]) mergeOnePartition(partDir string) error {
 			return err
 		}
 		defer cleanupMain()
-		incMergedCols := queryTableColumns(db, "inc_merged")
+		incMergedCols, err := queryTableColumns(db, "inc_merged")
+		if err != nil {
+			return err
+		}
 		mainGlob := buildFileList(localMain)
 		if _, err := db.Exec(fmt.Sprintf(`CREATE VIEW main_view AS SELECT * FROM read_parquet([%s], union_by_name=true)`, mainGlob)); err != nil {
 			return fmt.Errorf("read main: %w", err)
 		}
-		mainCols := queryTableColumns(db, "main_view")
+		mainCols, err := queryTableColumns(db, "main_view")
+		if err != nil {
+			return err
+		}
 
 		if err := buildMerged(db, schema, pkCols, incMergedCols, mainCols); err != nil {
 			return err
@@ -190,6 +202,9 @@ func (t *Table[T]) mergeFull() error {
 	schema := t.schema
 	pkCols := schema.PKColumns()
 	mainDir := t.mainDir()
+
+	// Serialize with any concurrent publish (merge or upsert) on this table.
+	defer t.db.lockPartition(mainDir)()
 
 	// Complete any cleanup an interrupted publish skipped before reading.
 	if err := recoverPartition(t.db.storage, mainDir); err != nil {
@@ -220,7 +235,10 @@ func (t *Table[T]) mergeFull() error {
 		return fmt.Errorf("read inc: %w", err)
 	}
 
-	incCols := queryTableColumns(db, "inc_data")
+	incCols, err := queryTableColumns(db, "inc_data")
+	if err != nil {
+		return err
+	}
 	activeFields := filterActiveFields(schema.Fields, incCols)
 
 	if err := buildIncMerged(db, pkCols, activeFields); err != nil {
@@ -233,12 +251,18 @@ func (t *Table[T]) mergeFull() error {
 			return err
 		}
 		defer cleanupMain()
-		incMergedCols := queryTableColumns(db, "inc_merged")
+		incMergedCols, err := queryTableColumns(db, "inc_merged")
+		if err != nil {
+			return err
+		}
 		mainGlob := buildFileList(localMain)
 		if _, err := db.Exec(fmt.Sprintf(`CREATE VIEW main_view AS SELECT * FROM read_parquet([%s], union_by_name=true)`, mainGlob)); err != nil {
 			return fmt.Errorf("read main: %w", err)
 		}
-		mainCols := queryTableColumns(db, "main_view")
+		mainCols, err := queryTableColumns(db, "main_view")
+		if err != nil {
+			return err
+		}
 
 		if err := buildMerged(db, schema, pkCols, incMergedCols, mainCols); err != nil {
 			return err
@@ -252,6 +276,8 @@ func (t *Table[T]) mergeFull() error {
 	if err := t.publishMerged(db, mainDir, incFiles); err != nil {
 		return err
 	}
+
+	cleanIncLeftovers(t.incDir())
 
 	log.Printf("[Fold] %s: merge complete", schema.Name)
 	return nil
@@ -439,20 +465,27 @@ func openDuckDB(dir string, opts DuckDBOptions) (db *sql.DB, cleanup func(), err
 	return db, cleanup, nil
 }
 
-func queryTableColumns(db *sql.DB, tableName string) map[string]bool {
+// queryTableColumns returns the column set of a DuckDB table. Failures are
+// fatal to the caller: swallowing one would filter every non-PK field out of
+// the merge and silently drop data.
+func queryTableColumns(db *sql.DB, tableName string) (map[string]bool, error) {
 	cols := make(map[string]bool)
 	rows, err := db.Query(fmt.Sprintf("SELECT column_name FROM information_schema.columns WHERE table_name = '%s'", tableName))
 	if err != nil {
-		return cols
+		return nil, fmt.Errorf("inspect columns of %s: %w", tableName, err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var name string
-		if rows.Scan(&name) == nil {
-			cols[name] = true
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("inspect columns of %s: %w", tableName, err)
 		}
+		cols[name] = true
 	}
-	return cols
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("inspect columns of %s: %w", tableName, err)
+	}
+	return cols, nil
 }
 
 func filterActiveFields(fields []Field, cols map[string]bool) []Field {
@@ -525,6 +558,27 @@ func buildFileList(files []string) string {
 		quoted[i] = sqlQuote(f)
 	}
 	return strings.Join(quoted, ", ")
+}
+
+// staleIncTmpAge is how old an inc-side .parquet.tmp must be before merge
+// garbage-collects it as a crash leftover. A live ImportWriter finishes a
+// staged file in well under this, so only files whose writer died are removed.
+const staleIncTmpAge = time.Hour
+
+// cleanIncLeftovers removes crash leftovers under the inc tree: staged
+// .parquet.tmp files old enough that no live writer can still own them
+// (main-side temp files are GC'd by finalizeDir; nothing else covers inc),
+// then any directories left empty.
+func cleanIncLeftovers(dir string) {
+	cutoff := time.Now().Add(-staleIncTmpAge)
+	filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() &&
+			strings.HasSuffix(info.Name(), ".parquet.tmp") && info.ModTime().Before(cutoff) {
+			os.Remove(p)
+		}
+		return nil
+	})
+	cleanEmptyDirs(dir)
 }
 
 func cleanEmptyDirs(dir string) {
