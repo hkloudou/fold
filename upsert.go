@@ -9,9 +9,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
+
+	"github.com/google/uuid"
 )
 
 // Upsert merges RawRecord rows directly into main/.
@@ -39,97 +38,10 @@ func (t *Table[T]) Upsert(source string, records []RawRecord) error {
 	if len(schema.Partitions) > 0 {
 		return t.upsertPartitioned(rows)
 	}
-	return t.upsertFull(rows)
-}
 
-// upsertFull merges an unpartitioned table directly.
-func (t *Table[T]) upsertFull(rows []map[string]any) error {
-	schema := t.schema
-	pkCols := schema.PKColumns()
-	mainDir := t.mainDir()
-
-	// Serialize with any concurrent publish (merge or upsert) on this table.
-	defer t.db.lockPartition(mainDir)()
-
-	// Recover any inc consumed by a prior crashed merge before advancing the
-	// commit record, so its consumed-inc state is never stranded.
-	if err := recoverPartition(t.db.storage, mainDir); err != nil {
-		return err
+	if err := t.upsertRows(t.mainDir(), rows); err != nil {
+		return fmt.Errorf("fold: upsert: %w", err)
 	}
-
-	// Active main files come from the manifest, consistent with Merge.
-	mainFiles, err := activeMainFiles(t.db.storage, mainDir)
-	if err != nil {
-		return err
-	}
-
-	// Write temporary Parquet.
-	tmpDir := filepath.Join(mainDir, fmt.Sprintf(".upsert_%d", time.Now().UnixNano()))
-	if err := writeParquet(tmpDir, schema, rows); err != nil {
-		os.RemoveAll(tmpDir)
-		return fmt.Errorf("fold: upsert write temporary file: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	tmpFiles := listParquetFiles(tmpDir)
-	if len(tmpFiles) == 0 {
-		return nil
-	}
-
-	db, cleanup, err := openDuckDB(mainDir, t.db.compact.DuckDB)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	// Read temporary data.
-	tmpGlob := buildFileList(tmpFiles)
-	if _, err := db.Exec(fmt.Sprintf(`CREATE TABLE inc_data AS SELECT * FROM read_parquet([%s], union_by_name=true)`, tmpGlob)); err != nil {
-		return fmt.Errorf("fold: upsert read temporary data: %w", err)
-	}
-
-	incCols, err := queryTableColumns(db, "inc_data")
-	if err != nil {
-		return err
-	}
-	activeFields := filterActiveFields(schema.Fields, incCols)
-
-	if err := buildIncMerged(db, pkCols, activeFields); err != nil {
-		return err
-	}
-
-	if len(mainFiles) > 0 {
-		localMain, cleanupMain, err := localizeMainFiles(t.db.storage, mainDir, mainFiles)
-		if err != nil {
-			return err
-		}
-		defer cleanupMain()
-		incMergedCols, err := queryTableColumns(db, "inc_merged")
-		if err != nil {
-			return err
-		}
-		mainGlob := buildFileList(localMain)
-		if _, err := db.Exec(fmt.Sprintf(`CREATE VIEW main_view AS SELECT * FROM read_parquet([%s], union_by_name=true)`, mainGlob)); err != nil {
-			return fmt.Errorf("fold: upsert read main: %w", err)
-		}
-		mainCols, err := queryTableColumns(db, "main_view")
-		if err != nil {
-			return err
-		}
-
-		if err := buildMerged(db, schema, pkCols, incMergedCols, mainCols); err != nil {
-			return err
-		}
-	} else {
-		if _, err := db.Exec(`CREATE TABLE result AS SELECT * FROM inc_merged`); err != nil {
-			return fmt.Errorf("fold: upsert create result table: %w", err)
-		}
-	}
-
-	if err := t.publishMerged(db, mainDir, nil); err != nil {
-		return fmt.Errorf("fold: upsert publish: %w", err)
-	}
-
 	log.Printf("[Fold] %s: upsert complete (%d records)", schema.Name, len(rows))
 	return nil
 }
@@ -138,153 +50,52 @@ func (t *Table[T]) upsertFull(rows []map[string]any) error {
 func (t *Table[T]) upsertPartitioned(rows []map[string]any) error {
 	schema := t.schema
 	groups := groupByPartitions(rows, schema)
-
 	if len(groups) == 0 {
 		return nil
 	}
 
 	log.Printf("[Fold] %s: upsert %d partitions", schema.Name, len(groups))
 
-	type partJob struct {
-		partDir string
-		rows    []map[string]any
+	parts := make([]string, 0, len(groups))
+	for p := range groups {
+		parts = append(parts, p)
 	}
+	sort.Strings(parts)
 
-	jobs := make(chan partJob, len(groups))
-	for partDir, partRows := range groups {
-		jobs <- partJob{partDir: partDir, rows: partRows}
-	}
-	close(jobs)
-
-	results := make(chan mergeResult, len(groups))
-	var wg sync.WaitGroup
-	var upsertedCount int64
-
-	workers := t.db.compact.Workers
-	if workers > len(groups) {
-		workers = len(groups)
-	}
-
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for job := range jobs {
-				err := t.upsertOnePartition(job.partDir, job.rows)
-				if err == nil {
-					atomic.AddInt64(&upsertedCount, 1)
-				}
-				results <- mergeResult{partDir: job.partDir, err: err}
-			}
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	var errs []string
-	for r := range results {
-		if r.err != nil {
-			log.Printf("[Fold] %s upsert partition %s failed: %v", schema.Name, r.partDir, r.err)
-			errs = append(errs, fmt.Sprintf("%s: %v", r.partDir, r.err))
+	errs := runPartitionJobs(schema.Name, t.db.compact.Workers, parts, func(partDir string) error {
+		mainPartDir := filepath.Join(t.mainDir(), partDir)
+		if err := os.MkdirAll(mainPartDir, 0755); err != nil {
+			return err
 		}
-	}
+		return t.upsertRows(mainPartDir, groups[partDir])
+	})
 
 	if len(errs) > 0 {
 		return fmt.Errorf("some partitions failed during upsert: %s", strings.Join(errs, "; "))
 	}
 
-	log.Printf("[Fold] %s: %d partitions upserted", schema.Name, upsertedCount)
+	log.Printf("[Fold] %s: %d partitions upserted", schema.Name, len(groups))
 	return nil
 }
 
-// upsertOnePartition merges a single partition.
-func (t *Table[T]) upsertOnePartition(partDir string, rows []map[string]any) error {
-	schema := t.schema
-	pkCols := schema.PKColumns()
-
-	mainPartDir := filepath.Join(t.mainDir(), partDir)
-	os.MkdirAll(mainPartDir, 0755)
-
-	// Serialize with any concurrent publish (merge or upsert) on this partition.
-	defer t.db.lockPartition(mainPartDir)()
-
-	// Recover any inc consumed by a prior crashed merge before advancing the
-	// commit record, so its consumed-inc state is never stranded.
-	if err := recoverPartition(t.db.storage, mainPartDir); err != nil {
-		return err
+// upsertRows stages rows as transient parquet OUTSIDE the partition directory
+// (so a recovery finalize triggered inside compactPartition can never mistake
+// them for publish outputs) and compacts them into dir. The staging files are
+// not recorded as consumed inputs — they are removed here, crash or not, and
+// a crashed upsert is simply retried by the caller.
+func (t *Table[T]) upsertRows(dir string, rows []map[string]any) error {
+	staging := filepath.Join(t.db.dir, ".staging", "upsert_"+uuid.New().String())
+	if err := writeParquet(staging, t.schema, rows); err != nil {
+		os.RemoveAll(staging)
+		return fmt.Errorf("write staging: %w", err)
 	}
+	defer os.RemoveAll(staging)
 
-	mainPartFiles, err := activeMainFiles(t.db.storage, mainPartDir)
-	if err != nil {
-		return err
-	}
-
-	// Write temporary Parquet.
-	tmpDir := filepath.Join(mainPartDir, fmt.Sprintf(".upsert_%d", time.Now().UnixNano()))
-	if err := writeParquet(tmpDir, schema, rows); err != nil {
-		os.RemoveAll(tmpDir)
-		return fmt.Errorf("write temporary file: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	tmpFiles := listParquetFiles(tmpDir)
-	if len(tmpFiles) == 0 {
+	stagingFiles := listParquetFiles(staging)
+	if len(stagingFiles) == 0 {
 		return nil
 	}
-
-	db, cleanup, err := openDuckDB(mainPartDir, t.db.compact.DuckDB)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	tmpGlob := buildFileList(tmpFiles)
-	if _, err := db.Exec(fmt.Sprintf(`CREATE TABLE inc_data AS SELECT * FROM read_parquet([%s], union_by_name=true)`, tmpGlob)); err != nil {
-		return fmt.Errorf("read temporary data: %w", err)
-	}
-
-	incCols, err := queryTableColumns(db, "inc_data")
-	if err != nil {
-		return err
-	}
-	activeFields := filterActiveFields(schema.Fields, incCols)
-
-	if err := buildIncMerged(db, pkCols, activeFields); err != nil {
-		return err
-	}
-
-	if len(mainPartFiles) > 0 {
-		localMain, cleanupMain, err := localizeMainFiles(t.db.storage, mainPartDir, mainPartFiles)
-		if err != nil {
-			return err
-		}
-		defer cleanupMain()
-		incMergedCols, err := queryTableColumns(db, "inc_merged")
-		if err != nil {
-			return err
-		}
-		mainGlob := buildFileList(localMain)
-		if _, err := db.Exec(fmt.Sprintf(`CREATE VIEW main_view AS SELECT * FROM read_parquet([%s], union_by_name=true)`, mainGlob)); err != nil {
-			return fmt.Errorf("read main: %w", err)
-		}
-		mainCols, err := queryTableColumns(db, "main_view")
-		if err != nil {
-			return err
-		}
-
-		if err := buildMerged(db, schema, pkCols, incMergedCols, mainCols); err != nil {
-			return err
-		}
-	} else {
-		if _, err := db.Exec(`CREATE TABLE result AS SELECT * FROM inc_merged`); err != nil {
-			return fmt.Errorf("create result table: %w", err)
-		}
-	}
-
-	return t.publishMerged(db, mainPartDir, nil)
+	return t.compactPartition(dir, func() ([]string, error) { return stagingFiles, nil }, false)
 }
 
 // convertRawRecords converts RawRecord rows into the map form used by writeParquet.
@@ -306,7 +117,7 @@ func convertRawRecords(schema *Schema, records []RawRecord) []map[string]any {
 			switch f.Type {
 			case FieldString:
 				if f.Strategy == StrategyJSONMerge {
-					if s := coerceJSON(v); s != "" {
+					if s := JSON(v); s != "" {
 						row[f.Column] = s
 					}
 				} else if s := coerceString(v); s != "" {
@@ -392,24 +203,12 @@ func coerceStringList(v any) []string {
 		}
 		return []string{s}
 	case []any:
-		var result []string
+		result := make([]string, 0, len(s))
 		for _, item := range s {
-			result = append(result, fmt.Sprintf("%v", item))
+			result = append(result, coerceString(item))
 		}
 		return result
 	default:
 		return nil
-	}
-}
-
-func coerceJSON(v any) string {
-	switch s := v.(type) {
-	case string:
-		return s
-	case []byte:
-		return string(s)
-	default:
-		b, _ := json.Marshal(v)
-		return string(b)
 	}
 }

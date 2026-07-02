@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	_ "github.com/marcboeker/go-duckdb/v2"
@@ -17,197 +16,7 @@ import (
 
 // Merge performs the CRDT-style merge from inc/ into main/.
 func (t *Table[T]) Merge() error {
-	schema := t.schema
-	incDir := t.incDir()
-	mainDir := t.mainDir()
-
-	if err := os.MkdirAll(mainDir, 0755); err != nil {
-		return err
-	}
-
-	incFiles := listParquetFiles(incDir)
-	if len(incFiles) == 0 {
-		return nil
-	}
-
-	if len(schema.Partitions) > 0 {
-		return t.mergePartitioned(incFiles)
-	}
-	return t.mergeFull()
-}
-
-// mergePartitioned merges partitions concurrently.
-func (t *Table[T]) mergePartitioned(incFiles []string) error {
-	schema := t.schema
-	partDirs := discoverPartitions(t.incDir(), len(schema.Partitions))
-	if len(partDirs) == 0 {
-		return nil
-	}
-
-	log.Printf("[Fold] %s: found %d partitions to merge", schema.Name, len(partDirs))
-
-	jobs := make(chan string, len(partDirs))
-	for _, pd := range partDirs {
-		jobs <- pd
-	}
-	close(jobs)
-
-	results := make(chan mergeResult, len(partDirs))
-	var wg sync.WaitGroup
-	var mergedCount int64
-
-	workers := t.db.compact.Workers
-	if workers > len(partDirs) {
-		workers = len(partDirs)
-	}
-
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for partDir := range jobs {
-				err := t.mergeOnePartition(partDir)
-				if err == nil {
-					atomic.AddInt64(&mergedCount, 1)
-				}
-				results <- mergeResult{partDir: partDir, err: err}
-			}
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	var errs []string
-	for r := range results {
-		if r.err != nil {
-			log.Printf("[Fold] %s partition %s failed: %v", schema.Name, r.partDir, r.err)
-			errs = append(errs, fmt.Sprintf("%s: %v", r.partDir, r.err))
-		}
-	}
-
-	cleanIncLeftovers(t.incDir())
-
-	if len(errs) > 0 {
-		return fmt.Errorf("some partitions failed: %s", strings.Join(errs, "; "))
-	}
-
-	log.Printf("[Fold] %s: %d partitions merged", schema.Name, mergedCount)
-	return nil
-}
-
-type mergeResult struct {
-	partDir string
-	err     error
-}
-
-// mergeOnePartition merges a single partition.
-func (t *Table[T]) mergeOnePartition(partDir string) error {
-	schema := t.schema
-	pkCols := schema.PKColumns()
-
-	mainPartDir := filepath.Join(t.mainDir(), partDir)
-	os.MkdirAll(mainPartDir, 0755)
-
-	// Serialize with any concurrent publish (merge or upsert) on this partition.
-	defer t.db.lockPartition(mainPartDir)()
-
-	// Complete any cleanup an interrupted publish skipped (delete already-consumed
-	// inc, remove superseded/orphaned files) before reading the partition.
-	if err := recoverPartition(t.db.storage, mainPartDir); err != nil {
-		return err
-	}
-
-	// Collect inc files for this partition from all sources; recovery has already
-	// removed any that the last commit consumed.
-	var incPartFiles []string
-	sources, _ := os.ReadDir(t.incDir())
-	for _, src := range sources {
-		if !src.IsDir() {
-			continue
-		}
-		srcPartDir := filepath.Join(t.incDir(), src.Name(), partDir)
-		incPartFiles = append(incPartFiles, listParquetFiles(srcPartDir)...)
-	}
-	if len(incPartFiles) == 0 {
-		return nil
-	}
-
-	// Active main files come from the manifest, so files left behind by an
-	// interrupted publish are ignored rather than read twice.
-	mainPartFiles, err := activeMainFiles(t.db.storage, mainPartDir)
-	if err != nil {
-		return err
-	}
-
-	db, cleanup, err := openDuckDB(mainPartDir, t.db.compact.DuckDB)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	// Read inc data.
-	incGlob := buildFileList(incPartFiles)
-	if _, err := db.Exec(fmt.Sprintf(`CREATE TABLE inc_data AS SELECT * FROM read_parquet([%s], union_by_name=true)`, incGlob)); err != nil {
-		return fmt.Errorf("read inc: %w", err)
-	}
-
-	// Detect actual columns.
-	incCols, err := queryTableColumns(db, "inc_data")
-	if err != nil {
-		return err
-	}
-	activeFields := filterActiveFields(schema.Fields, incCols)
-
-	// Pre-merge inc rows.
-	if err := buildIncMerged(db, pkCols, activeFields); err != nil {
-		return err
-	}
-
-	if len(mainPartFiles) > 0 {
-		localMain, cleanupMain, err := localizeMainFiles(t.db.storage, mainPartDir, mainPartFiles)
-		if err != nil {
-			return err
-		}
-		defer cleanupMain()
-		incMergedCols, err := queryTableColumns(db, "inc_merged")
-		if err != nil {
-			return err
-		}
-		mainGlob := buildFileList(localMain)
-		if _, err := db.Exec(fmt.Sprintf(`CREATE VIEW main_view AS SELECT * FROM read_parquet([%s], union_by_name=true)`, mainGlob)); err != nil {
-			return fmt.Errorf("read main: %w", err)
-		}
-		mainCols, err := queryTableColumns(db, "main_view")
-		if err != nil {
-			return err
-		}
-
-		if err := buildMerged(db, schema, pkCols, incMergedCols, mainCols); err != nil {
-			return err
-		}
-	} else {
-		if _, err := db.Exec(`CREATE TABLE result AS SELECT * FROM inc_merged`); err != nil {
-			return fmt.Errorf("create result table: %w", err)
-		}
-	}
-
-	return t.publishMerged(db, mainPartDir, incPartFiles)
-}
-
-// mergeFull merges an unpartitioned table.
-func (t *Table[T]) mergeFull() error {
-	schema := t.schema
-	pkCols := schema.PKColumns()
-	mainDir := t.mainDir()
-
-	// Serialize with any concurrent publish (merge or upsert) on this table.
-	defer t.db.lockPartition(mainDir)()
-
-	// Complete any cleanup an interrupted publish skipped before reading.
-	if err := recoverPartition(t.db.storage, mainDir); err != nil {
+	if err := os.MkdirAll(t.mainDir(), 0755); err != nil {
 		return err
 	}
 
@@ -216,79 +25,235 @@ func (t *Table[T]) mergeFull() error {
 		return nil
 	}
 
-	mainFiles, err := activeMainFiles(t.db.storage, mainDir)
+	if len(t.schema.Partitions) > 0 {
+		return t.mergePartitioned()
+	}
+	return t.mergeFull()
+}
+
+// mergePartitioned merges partitions concurrently.
+func (t *Table[T]) mergePartitioned() error {
+	schema := t.schema
+	partDirs := discoverPartitions(t.incDir(), len(schema.Partitions))
+	if len(partDirs) == 0 {
+		return nil
+	}
+
+	log.Printf("[Fold] %s: found %d partitions to merge", schema.Name, len(partDirs))
+
+	errs := runPartitionJobs(schema.Name, t.db.compact.Workers, partDirs, t.mergeOnePartition)
+
+	cleanIncLeftovers(t.incDir())
+
+	if len(errs) > 0 {
+		return fmt.Errorf("some partitions failed: %s", strings.Join(errs, "; "))
+	}
+
+	log.Printf("[Fold] %s: %d partitions merged", schema.Name, len(partDirs))
+	return nil
+}
+
+// runPartitionJobs runs fn over parts with a bounded worker pool, logging each
+// failure as it happens and returning one "part: err" entry per failure.
+func runPartitionJobs(name string, workers int, parts []string, fn func(string) error) []string {
+	if workers > len(parts) {
+		workers = len(parts)
+	}
+
+	jobs := make(chan string, len(parts))
+	for _, p := range parts {
+		jobs <- p
+	}
+	close(jobs)
+
+	type result struct {
+		part string
+		err  error
+	}
+	results := make(chan result, len(parts))
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := range jobs {
+				results <- result{part: p, err: fn(p)}
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var errs []string
+	for r := range results {
+		if r.err != nil {
+			log.Printf("[Fold] %s partition %s failed: %v", name, r.part, r.err)
+			errs = append(errs, fmt.Sprintf("%s: %v", r.part, r.err))
+		}
+	}
+	return errs
+}
+
+// mergeOnePartition merges a single partition.
+func (t *Table[T]) mergeOnePartition(partDir string) error {
+	mainPartDir := filepath.Join(t.mainDir(), partDir)
+	if err := os.MkdirAll(mainPartDir, 0755); err != nil {
+		return err
+	}
+	return t.compactPartition(mainPartDir, func() ([]string, error) {
+		// Collect this partition's inc files from all sources; recovery has
+		// already removed any that the last commit consumed.
+		var files []string
+		sources, err := os.ReadDir(t.incDir())
+		if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+		for _, src := range sources {
+			if !src.IsDir() {
+				continue
+			}
+			files = append(files, listParquetFiles(filepath.Join(t.incDir(), src.Name(), partDir))...)
+		}
+		return files, nil
+	}, true)
+}
+
+// mergeFull merges an unpartitioned table.
+func (t *Table[T]) mergeFull() error {
+	err := t.compactPartition(t.mainDir(), func() ([]string, error) {
+		return listParquetFiles(t.incDir()), nil
+	}, true)
 	if err != nil {
-		return err
-	}
-
-	log.Printf("[Fold] %s: full merge inc=%d main=%d", schema.Name, len(incFiles), len(mainFiles))
-
-	db, cleanup, err := openDuckDB(mainDir, t.db.compact.DuckDB)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	// Read inc data.
-	incGlob := buildFileList(incFiles)
-	if _, err := db.Exec(fmt.Sprintf(`CREATE TABLE inc_data AS SELECT * FROM read_parquet([%s], union_by_name=true)`, incGlob)); err != nil {
-		return fmt.Errorf("read inc: %w", err)
-	}
-
-	incCols, err := queryTableColumns(db, "inc_data")
-	if err != nil {
-		return err
-	}
-	activeFields := filterActiveFields(schema.Fields, incCols)
-
-	if err := buildIncMerged(db, pkCols, activeFields); err != nil {
-		return err
-	}
-
-	if len(mainFiles) > 0 {
-		localMain, cleanupMain, err := localizeMainFiles(t.db.storage, mainDir, mainFiles)
-		if err != nil {
-			return err
-		}
-		defer cleanupMain()
-		incMergedCols, err := queryTableColumns(db, "inc_merged")
-		if err != nil {
-			return err
-		}
-		mainGlob := buildFileList(localMain)
-		if _, err := db.Exec(fmt.Sprintf(`CREATE VIEW main_view AS SELECT * FROM read_parquet([%s], union_by_name=true)`, mainGlob)); err != nil {
-			return fmt.Errorf("read main: %w", err)
-		}
-		mainCols, err := queryTableColumns(db, "main_view")
-		if err != nil {
-			return err
-		}
-
-		if err := buildMerged(db, schema, pkCols, incMergedCols, mainCols); err != nil {
-			return err
-		}
-	} else {
-		if _, err := db.Exec(`CREATE TABLE result AS SELECT * FROM inc_merged`); err != nil {
-			return fmt.Errorf("create result table: %w", err)
-		}
-	}
-
-	if err := t.publishMerged(db, mainDir, incFiles); err != nil {
 		return err
 	}
 
 	cleanIncLeftovers(t.incDir())
 
-	log.Printf("[Fold] %s: merge complete", schema.Name)
+	log.Printf("[Fold] %s: merge complete", t.schema.Name)
 	return nil
 }
 
-// publishMerged stages the DuckDB `result` table, finishes it completely
-// (bloom rewrite) before it becomes active, validates it, then atomically
-// publishes it as the partition's single active file via the manifest,
-// recording consumedInc so a retry never re-applies it. Bloom and validation
-// run on the staging file so a failure never publishes over live data.
-func (t *Table[T]) publishMerged(db *sql.DB, dir string, consumedInc []string) error {
+// compactPartition folds collected input parquet into dir's active file set
+// and publishes the result as the partition's single active file. It is the
+// shared core of Merge and Upsert. collect runs after crash recovery, so it
+// never sees inputs a previous commit already consumed. consumeInputs records
+// the collected files in the commit so a retry never re-applies them (true
+// for merge; false for upsert, whose inputs are transient staging files
+// outside the partition directory).
+func (t *Table[T]) compactPartition(dir string, collect func() ([]string, error), consumeInputs bool) error {
+	// Serialize with any concurrent publish (merge or upsert) on this partition.
+	unlock := t.db.lockPartition(dir)
+	defer unlock()
+
+	// Complete any cleanup an interrupted publish skipped (delete already-
+	// consumed inc, remove superseded/orphaned files) before reading.
+	if err := recoverPartition(t.db.storage, dir); err != nil {
+		return err
+	}
+
+	incFiles, err := collect()
+	if err != nil {
+		return err
+	}
+	if len(incFiles) == 0 {
+		return nil
+	}
+
+	// Active main files come from the manifest, so files left behind by an
+	// interrupted publish are ignored rather than read twice.
+	mainFiles, err := activeMainFiles(t.db.storage, dir)
+	if err != nil {
+		return err
+	}
+	localMain, cleanupMain, err := localizeMainFiles(t.db.storage, dir, mainFiles)
+	if err != nil {
+		return err
+	}
+	defer cleanupMain()
+
+	db, cleanup, err := openDuckDB(dir, t.db.compact.DuckDB)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	incCols, err := describeColumns(db, incFiles)
+	if err != nil {
+		return fmt.Errorf("inspect inc columns: %w", err)
+	}
+	mainCols := map[string]bool{}
+	if len(localMain) > 0 {
+		if mainCols, err = describeColumns(db, localMain); err != nil {
+			return fmt.Errorf("inspect main columns: %w", err)
+		}
+	}
+
+	query := buildCompactQuery(t.schema, incFiles, localMain, incCols, mainCols)
+	var consumed []string
+	if consumeInputs {
+		consumed = incFiles
+	}
+	return t.publishCompact(db, dir, query, consumed)
+}
+
+// buildCompactQuery returns the single streaming SELECT that pre-merges inc
+// rows (GROUP BY primary key) and folds them into the active main rows (FULL
+// OUTER JOIN). DuckDB executes it as one pipeline feeding the COPY: nothing
+// is materialized into tables, and operators spill to the job's temp
+// directory under memory pressure.
+func buildCompactQuery(schema *Schema, incFiles, mainFiles []string, incCols, mainCols map[string]bool) string {
+	pkCols := schema.PKColumns()
+	activeFields := filterActiveFields(schema.Fields, incCols)
+	groupBy := strings.Join(pkCols, ", ")
+
+	sel := groupBy
+	for _, f := range activeFields {
+		if f.Strategy != StrategyPK {
+			sel += ", " + f.GetAggExpr()
+		}
+	}
+	incQuery := fmt.Sprintf(`SELECT %s FROM read_parquet([%s], union_by_name=true) GROUP BY %s`,
+		sel, buildFileList(incFiles), groupBy)
+
+	if len(mainFiles) == 0 {
+		return incQuery
+	}
+
+	// Column sets on each side of the join: s (pre-merged inc) has exactly
+	// the active fields; t (main) has whatever the active files contain.
+	inInc := make(map[string]bool, len(activeFields))
+	for _, f := range activeFields {
+		inInc[f.Column] = true
+	}
+	var selectExprs []string
+	for _, f := range schema.Fields {
+		switch {
+		case inInc[f.Column] && mainCols[f.Column]:
+			selectExprs = append(selectExprs, f.GetSQLExpr()+" AS "+f.Column)
+		case inInc[f.Column]:
+			selectExprs = append(selectExprs, "s."+f.Column)
+		case mainCols[f.Column]:
+			selectExprs = append(selectExprs, "t."+f.Column)
+		}
+	}
+	joinConds := make([]string, len(pkCols))
+	for i, col := range pkCols {
+		joinConds[i] = fmt.Sprintf("s.%s = t.%s", col, col)
+	}
+
+	return fmt.Sprintf(`SELECT %s FROM (%s) s FULL OUTER JOIN read_parquet([%s], union_by_name=true) t ON %s`,
+		strings.Join(selectExprs, ", "), incQuery, buildFileList(mainFiles), strings.Join(joinConds, " AND "))
+}
+
+// publishCompact streams query into a staged parquet file, finishes it
+// completely (bloom rewrite) and validates it before it becomes active, then
+// atomically publishes it as the partition's single active file via the
+// manifest, recording consumedInc so a retry never re-applies it. Bloom and
+// validation run on the staging file so a failure never publishes over live
+// data.
+func (t *Table[T]) publishCompact(db *sql.DB, dir, query string, consumedInc []string) error {
 	ts := time.Now().UnixMilli()
 	filesDir := filepath.Join(dir, filesSubdir)
 	if err := os.MkdirAll(filesDir, 0755); err != nil {
@@ -298,9 +263,16 @@ func (t *Table[T]) publishMerged(db *sql.DB, dir string, consumedInc []string) e
 	finalRel := filepath.Join(filesSubdir, fmt.Sprintf("merged_%d.parquet", ts))
 	finalFile := filepath.Join(dir, finalRel)
 
-	if _, err := db.Exec(fmt.Sprintf(`COPY result TO %s (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3)`, sqlQuote(tmpFile))); err != nil {
+	res, err := db.Exec(fmt.Sprintf(`COPY (%s) TO %s (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3)`,
+		query, sqlQuote(tmpFile)))
+	if err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("write result: %w", err)
+	}
+	written, err := res.RowsAffected()
+	if err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("rows written: %w", err)
 	}
 
 	// Bloom rewrite runs on the staging file, before it becomes active. It is
@@ -312,9 +284,16 @@ func (t *Table[T]) publishMerged(db *sql.DB, dir string, consumedInc []string) e
 		return fmt.Errorf("add bloom filters: %w", err)
 	}
 
-	if err := validateStagedParquet(db, tmpFile); err != nil {
+	// A truncated or corrupt staging file must never be published over live
+	// data: it has to read back with exactly the row count COPY reported.
+	var fileRows int64
+	if err := db.QueryRow(fmt.Sprintf(`SELECT count(*) FROM read_parquet(%s)`, sqlQuote(tmpFile))).Scan(&fileRows); err != nil {
 		os.Remove(tmpFile)
-		return fmt.Errorf("validate staged output: %w", err)
+		return fmt.Errorf("count staged file: %w", err)
+	}
+	if fileRows != written {
+		os.Remove(tmpFile)
+		return fmt.Errorf("row count mismatch: wrote %d rows, staged file has %d", written, fileRows)
 	}
 
 	if err := t.db.storage.UploadFile(tmpFile, finalFile); err != nil {
@@ -350,111 +329,38 @@ func (t *Table[T]) maybeAddBloom(path string) error {
 	return addBloomFilters(path, t.schema)
 }
 
-// validateStagedParquet checks that a freshly written parquet file reads back
-// with the same row count as the result table, catching a truncated or corrupt
-// write before it is published over active data.
-func validateStagedParquet(db *sql.DB, path string) error {
-	var resultRows, fileRows int64
-	if err := db.QueryRow(`SELECT count(*) FROM result`).Scan(&resultRows); err != nil {
-		return fmt.Errorf("count result: %w", err)
-	}
-	if err := db.QueryRow(fmt.Sprintf(`SELECT count(*) FROM read_parquet(%s)`, sqlQuote(path))).Scan(&fileRows); err != nil {
-		return fmt.Errorf("count staged file: %w", err)
-	}
-	if resultRows != fileRows {
-		return fmt.Errorf("row count mismatch: result has %d rows, staged file has %d", resultRows, fileRows)
-	}
-	return nil
-}
-
-// buildIncMerged creates the inc pre-merge table: GROUP BY pk(s).
-func buildIncMerged(db *sql.DB, pkCols []string, fields []Field) error {
-	var aggExprs []string
-	for _, f := range fields {
-		if f.Strategy == StrategyPK {
-			continue
-		}
-		aggExprs = append(aggExprs, f.GetAggExpr())
-	}
-
-	aggStr := ""
-	if len(aggExprs) > 0 {
-		aggStr = ",\n  " + strings.Join(aggExprs, ",\n  ")
-	}
-
-	groupBy := strings.Join(pkCols, ", ")
-	sql := fmt.Sprintf(`CREATE TABLE inc_merged AS
-SELECT %s%s
-FROM inc_data
-GROUP BY %s`, groupBy, aggStr, groupBy)
-
-	if _, err := db.Exec(sql); err != nil {
-		return fmt.Errorf("inc pre-merge failed: %w", err)
-	}
-	return nil
-}
-
-// buildMerged creates the FULL OUTER JOIN merge table and writes it to result.
-// json_merge is handled directly through DuckDB json_merge_patch SQL.
-func buildMerged(db *sql.DB, schema *Schema, pkCols []string, incCols, mainCols map[string]bool) error {
-	var selectExprs []string
-
-	for _, f := range schema.Fields {
-		inInc := incCols[f.Column]
-		inMain := mainCols[f.Column]
-		if !inInc && !inMain {
-			continue
-		}
-
-		if inInc && inMain {
-			selectExprs = append(selectExprs, f.GetSQLExpr()+" AS "+f.Column)
-		} else if inInc {
-			selectExprs = append(selectExprs, "s."+f.Column)
-		} else {
-			selectExprs = append(selectExprs, "t."+f.Column)
-		}
-	}
-
-	var joinConds []string
-	for _, col := range pkCols {
-		joinConds = append(joinConds, fmt.Sprintf("s.%s = t.%s", col, col))
-	}
-
-	mergeSQL := fmt.Sprintf(`CREATE TABLE result AS
-SELECT %s
-FROM inc_merged s
-FULL OUTER JOIN main_view t ON %s`,
-		strings.Join(selectExprs, ", "), strings.Join(joinConds, " AND "))
-
-	if _, err := db.Exec(mergeSQL); err != nil {
-		return fmt.Errorf("merge execution failed: %w", err)
-	}
-	return nil
-}
-
 // --- DuckDB helpers ---
 
+// openDuckDB opens an in-memory DuckDB for one compaction job. The streaming
+// compact query materializes nothing into tables, so the database itself stays
+// tiny; operators spill to a per-job temp directory under dir (or opts.TempDir
+// when set) once memory_limit is reached. cleanup closes the DB and removes
+// the derived spill directory.
 func openDuckDB(dir string, opts DuckDBOptions) (db *sql.DB, cleanup func(), err error) {
-	dbPath := filepath.Join(dir, fmt.Sprintf(".duckdb_%d.db", time.Now().UnixNano()))
-	db, err = sql.Open("duckdb", dbPath)
+	db, err = sql.Open("duckdb", "")
 	if err != nil {
 		return nil, nil, err
 	}
+	tempDir := opts.TempDir
+	removeTemp := ""
+	if tempDir == "" {
+		tempDir = filepath.Join(dir, fmt.Sprintf(".duckdb_tmp_%d", time.Now().UnixNano()))
+		removeTemp = tempDir
+	}
 	cleanup = func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + ".wal")
+		if removeTemp != "" {
+			os.RemoveAll(removeTemp)
+		}
 	}
 
 	// Apply execution settings, surfacing a rejected option (e.g. an invalid
 	// memory_limit or temp_directory) instead of silently running with
 	// unintended defaults.
 	pragmas := []string{
-		fmt.Sprintf("PRAGMA memory_limit='%s'", opts.MemoryLimit),
+		fmt.Sprintf("PRAGMA memory_limit=%s", sqlQuote(opts.MemoryLimit)),
 		fmt.Sprintf("PRAGMA threads=%d", opts.Threads),
-	}
-	if opts.TempDir != "" {
-		pragmas = append(pragmas, fmt.Sprintf("PRAGMA temp_directory='%s'", opts.TempDir))
+		fmt.Sprintf("PRAGMA temp_directory=%s", sqlQuote(tempDir)),
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {
@@ -465,27 +371,35 @@ func openDuckDB(dir string, opts DuckDBOptions) (db *sql.DB, cleanup func(), err
 	return db, cleanup, nil
 }
 
-// queryTableColumns returns the column set of a DuckDB table. Failures are
-// fatal to the caller: swallowing one would filter every non-PK field out of
-// the merge and silently drop data.
-func queryTableColumns(db *sql.DB, tableName string) (map[string]bool, error) {
-	cols := make(map[string]bool)
-	rows, err := db.Query(fmt.Sprintf("SELECT column_name FROM information_schema.columns WHERE table_name = '%s'", tableName))
+// describeColumns returns the union column set of parquet files without
+// materializing them (DESCRIBE plans the scan but reads no rows). Failures
+// are fatal to the caller: swallowing one would filter every non-PK field out
+// of the merge and silently drop data.
+func describeColumns(db *sql.DB, files []string) (map[string]bool, error) {
+	rows, err := db.Query(fmt.Sprintf(`DESCRIBE SELECT * FROM read_parquet([%s], union_by_name=true)`, buildFileList(files)))
 	if err != nil {
-		return nil, fmt.Errorf("inspect columns of %s: %w", tableName, err)
+		return nil, err
 	}
 	defer rows.Close()
+
+	outCols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	cols := make(map[string]bool)
 	for rows.Next() {
 		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("inspect columns of %s: %w", tableName, err)
+		dest := make([]any, len(outCols))
+		dest[0] = &name
+		for i := 1; i < len(dest); i++ {
+			dest[i] = new(sql.NullString)
+		}
+		if err := rows.Scan(dest...); err != nil {
+			return nil, err
 		}
 		cols[name] = true
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("inspect columns of %s: %w", tableName, err)
-	}
-	return cols, nil
+	return cols, rows.Err()
 }
 
 func filterActiveFields(fields []Field, cols map[string]bool) []Field {

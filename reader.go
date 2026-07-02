@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/tidwall/gjson"
 	"github.com/xuri/excelize/v2"
@@ -72,14 +73,26 @@ func (r RawRecord) Int64(field string) int64 {
 	}
 }
 
-// Match reports whether a string field matches a regular expression.
+// regexCache holds compiled patterns for Match, which is typically called
+// once per record with a handful of fixed patterns.
+var regexCache sync.Map // pattern -> *regexp.Regexp
+
+// Match reports whether a string field matches a regular expression. An
+// invalid pattern matches nothing.
 func (r RawRecord) Match(field, pattern string) bool {
 	v := r.Str(field)
 	if v == "" {
 		return false
 	}
-	matched, _ := regexp.MatchString(pattern, v)
-	return matched
+	re, ok := regexCache.Load(pattern)
+	if !ok {
+		compiled, err := regexp.Compile(pattern)
+		if err != nil {
+			return false
+		}
+		re, _ = regexCache.LoadOrStore(pattern, compiled)
+	}
+	return re.(*regexp.Regexp).MatchString(v)
 }
 
 // ExcelOpt configures Excel parsing.
