@@ -84,7 +84,7 @@ func partitionDirFor(row map[string]any, schema *Schema) string {
 	}
 	parts := make([]string, 0, len(schema.Partitions))
 	for _, p := range schema.Partitions {
-		parts = append(parts, fmt.Sprintf("%s=%s", p.Key, encodePartitionValue(evalPartition(row, p, schema))))
+		parts = append(parts, p.Key+"="+encodePartitionValue(evalPartition(row, p, schema)))
 	}
 	return filepath.Join(parts...)
 }
@@ -143,7 +143,11 @@ func evalPartition(row map[string]any, p PartitionRule, schema *Schema) string {
 
 	val := ""
 	if v, ok := row[col]; ok && v != nil {
-		val = fmt.Sprintf("%v", v)
+		if s, isStr := v.(string); isStr {
+			val = s
+		} else {
+			val = fmt.Sprintf("%v", v)
+		}
 	}
 
 	if p.Hash > 0 {
@@ -301,10 +305,13 @@ func buildArrowBuilder(alloc memory.Allocator, f Field) array.Builder {
 func appendValue(builder array.Builder, f Field, val any) {
 	switch b := builder.(type) {
 	case *array.StringBuilder:
-		if val == nil {
+		switch v := val.(type) {
+		case nil:
 			b.AppendNull()
-		} else {
-			b.Append(fmt.Sprintf("%v", val))
+		case string:
+			b.Append(v)
+		default:
+			b.Append(fmt.Sprintf("%v", v))
 		}
 	case *array.Int64Builder:
 		if val == nil {

@@ -201,8 +201,13 @@ db, _ := fold.Open("./data", fold.WithCompactOptions(fold.CompactOptions{
 }))
 ```
 
-Unset fields fall back to defaults: 10 workers, `2GB` memory, 4 threads, and no
-explicit temp directory.
+Unset fields fall back to defaults: 10 workers, `2GB` memory, 4 threads, and a
+per-job spill directory under the partition being merged.
+
+Each merge/upsert job runs one streaming DuckDB query (pre-merge `GROUP BY`
+feeding a `FULL OUTER JOIN` feeding the parquet `COPY`): nothing is
+materialized into tables, so memory stays within `MemoryLimit` and operators
+spill to `TempDir` under pressure.
 
 Bloom filters only accelerate primary-key lookups; they are never required for
 correctness. The post-merge rewrite is skipped automatically for outputs larger
