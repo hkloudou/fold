@@ -16,6 +16,11 @@ import (
 
 // Upsert merges RawRecord rows directly into main/.
 // Internally it writes temporary Parquet, merges with DuckDB, writes main, and cleans up.
+//
+// The source parameter is currently unused: unlike Import, an upsert goes
+// straight to main/ and leaves no per-source trace. It is kept so call sites
+// stay symmetric with Import and a future audit trail can use it without an
+// API break.
 func (t *Table[T]) Upsert(source string, records []RawRecord) error {
 	if len(records) == 0 {
 		return nil
@@ -42,6 +47,9 @@ func (t *Table[T]) upsertFull(rows []map[string]any) error {
 	schema := t.schema
 	pkCols := schema.PKColumns()
 	mainDir := t.mainDir()
+
+	// Serialize with any concurrent publish (merge or upsert) on this table.
+	defer t.db.lockPartition(mainDir)()
 
 	// Recover any inc consumed by a prior crashed merge before advancing the
 	// commit record, so its consumed-inc state is never stranded.
@@ -80,7 +88,10 @@ func (t *Table[T]) upsertFull(rows []map[string]any) error {
 		return fmt.Errorf("fold: upsert read temporary data: %w", err)
 	}
 
-	incCols := queryTableColumns(db, "inc_data")
+	incCols, err := queryTableColumns(db, "inc_data")
+	if err != nil {
+		return err
+	}
 	activeFields := filterActiveFields(schema.Fields, incCols)
 
 	if err := buildIncMerged(db, pkCols, activeFields); err != nil {
@@ -93,12 +104,18 @@ func (t *Table[T]) upsertFull(rows []map[string]any) error {
 			return err
 		}
 		defer cleanupMain()
-		incMergedCols := queryTableColumns(db, "inc_merged")
+		incMergedCols, err := queryTableColumns(db, "inc_merged")
+		if err != nil {
+			return err
+		}
 		mainGlob := buildFileList(localMain)
 		if _, err := db.Exec(fmt.Sprintf(`CREATE VIEW main_view AS SELECT * FROM read_parquet([%s], union_by_name=true)`, mainGlob)); err != nil {
 			return fmt.Errorf("fold: upsert read main: %w", err)
 		}
-		mainCols := queryTableColumns(db, "main_view")
+		mainCols, err := queryTableColumns(db, "main_view")
+		if err != nil {
+			return err
+		}
 
 		if err := buildMerged(db, schema, pkCols, incMergedCols, mainCols); err != nil {
 			return err
@@ -191,6 +208,9 @@ func (t *Table[T]) upsertOnePartition(partDir string, rows []map[string]any) err
 	mainPartDir := filepath.Join(t.mainDir(), partDir)
 	os.MkdirAll(mainPartDir, 0755)
 
+	// Serialize with any concurrent publish (merge or upsert) on this partition.
+	defer t.db.lockPartition(mainPartDir)()
+
 	// Recover any inc consumed by a prior crashed merge before advancing the
 	// commit record, so its consumed-inc state is never stranded.
 	if err := recoverPartition(t.db.storage, mainPartDir); err != nil {
@@ -226,7 +246,10 @@ func (t *Table[T]) upsertOnePartition(partDir string, rows []map[string]any) err
 		return fmt.Errorf("read temporary data: %w", err)
 	}
 
-	incCols := queryTableColumns(db, "inc_data")
+	incCols, err := queryTableColumns(db, "inc_data")
+	if err != nil {
+		return err
+	}
 	activeFields := filterActiveFields(schema.Fields, incCols)
 
 	if err := buildIncMerged(db, pkCols, activeFields); err != nil {
@@ -239,12 +262,18 @@ func (t *Table[T]) upsertOnePartition(partDir string, rows []map[string]any) err
 			return err
 		}
 		defer cleanupMain()
-		incMergedCols := queryTableColumns(db, "inc_merged")
+		incMergedCols, err := queryTableColumns(db, "inc_merged")
+		if err != nil {
+			return err
+		}
 		mainGlob := buildFileList(localMain)
 		if _, err := db.Exec(fmt.Sprintf(`CREATE VIEW main_view AS SELECT * FROM read_parquet([%s], union_by_name=true)`, mainGlob)); err != nil {
 			return fmt.Errorf("read main: %w", err)
 		}
-		mainCols := queryTableColumns(db, "main_view")
+		mainCols, err := queryTableColumns(db, "main_view")
+		if err != nil {
+			return err
+		}
 
 		if err := buildMerged(db, schema, pkCols, incMergedCols, mainCols); err != nil {
 			return err

@@ -97,6 +97,9 @@ type ExcelOpt struct {
 //   - &: merge all non-empty columns into []string
 //   - |: select the first non-empty column value
 func ReadExcel(path string, opt *ExcelOpt) ([]RawRecord, error) {
+	if opt == nil {
+		opt = &ExcelOpt{}
+	}
 	f, err := excelize.OpenFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("fold: open Excel: %w", err)
@@ -240,6 +243,9 @@ type JSONLOpt struct {
 
 // ReadJSONL parses a JSONL file into RawRecord rows.
 func ReadJSONL(path string, opt *JSONLOpt) ([]RawRecord, error) {
+	if opt == nil {
+		opt = &JSONLOpt{}
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("fold: open JSONL: %w", err)

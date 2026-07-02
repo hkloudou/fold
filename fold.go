@@ -23,12 +23,26 @@ func JSON(v any) string {
 
 // DB is the root Fold handle, similar in spirit to gorm.DB.
 type DB struct {
-	dir     string             // data root directory
-	tables  map[string]*Schema // registered table schemas
-	compact CompactOptions     // merge/upsert worker and DuckDB execution tuning
-	storage Storage            // metadata + object persistence (default: local filesystem)
-	bloomMu sync.Mutex         // serializes whole-file bloom rewrites across concurrent workers
-	mu      sync.RWMutex
+	dir       string             // data root directory
+	tables    map[string]*Schema // registered table schemas
+	compact   CompactOptions     // merge/upsert worker and DuckDB execution tuning
+	storage   Storage            // metadata + object persistence (default: local filesystem)
+	bloomMu   sync.Mutex         // serializes whole-file bloom rewrites across concurrent workers
+	partLocks sync.Map           // partition dir -> *sync.Mutex; serializes publishes per partition
+	mu        sync.RWMutex
+}
+
+// lockPartition serializes merge/upsert publishes for one partition directory
+// within this DB handle, so a concurrent Merge and Upsert on the same
+// partition cannot interleave read-manifest/commit and lose one of the
+// updates. Two Open() handles on the same data root are NOT coordinated —
+// like cross-process and cross-machine writers, that remains out of scope
+// (single writer per table). The returned func releases the lock.
+func (db *DB) lockPartition(dir string) func() {
+	m, _ := db.partLocks.LoadOrStore(dir, &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // DuckDBOptions tunes the per-job DuckDB execution used by merge and upsert.
