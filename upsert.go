@@ -300,12 +300,17 @@ func convertRawRecords(schema *Schema, records []RawRecord) []map[string]any {
 				continue
 			}
 
+			// Zero values are treated as absent, matching Import (extractRow
+			// skips IsZero fields): an empty string must not overwrite or
+			// coalesce over existing data.
 			switch f.Type {
 			case FieldString:
 				if f.Strategy == StrategyJSONMerge {
-					row[f.Column] = coerceJSON(v)
-				} else {
-					row[f.Column] = coerceString(v)
+					if s := coerceJSON(v); s != "" {
+						row[f.Column] = s
+					}
+				} else if s := coerceString(v); s != "" {
+					row[f.Column] = s
 				}
 			case FieldInt64:
 				if n := coerceInt64(v); n != 0 {

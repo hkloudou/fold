@@ -232,7 +232,6 @@ func writeParquet(dir string, schema *Schema, rows []map[string]any) error {
 	if err != nil {
 		return err
 	}
-	defer outFile.Close()
 
 	// Writer properties: Zstd compression and bloom filters.
 	writerOpts := []parquet.WriterProperty{
@@ -249,6 +248,7 @@ func writeParquet(dir string, schema *Schema, rows []map[string]any) error {
 
 	writer, err := pqarrow.NewFileWriter(arrowSchema, outFile, writerProps, arrowProps)
 	if err != nil {
+		outFile.Close()
 		os.Remove(tmpPath)
 		return err
 	}
@@ -259,6 +259,9 @@ func writeParquet(dir string, schema *Schema, rows []map[string]any) error {
 		return err
 	}
 
+	// writer.Close writes the footer and closes outFile (the parquet writer
+	// closes its sink), so the staged file is closed before the rename — a
+	// rename of an open file fails on Windows.
 	if err := writer.Close(); err != nil {
 		os.Remove(tmpPath)
 		return err

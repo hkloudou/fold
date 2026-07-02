@@ -293,10 +293,12 @@ func TestImportSourceSanitized(t *testing.T) {
 	defer db.Close()
 	table := Register[AreaRow](db)
 
-	// Date-derived source with separators, plus a traversal attempt and an
+	// Date-derived source with separators, traversal attempts (including bare
+	// dot segments, which filepath.Join would elide or collapse), and an
 	// empty source: all must land exactly one directory under inc/<table>/.
-	for _, src := range []string{"2026/07/02", "../../evil", ""} {
-		if err := table.Import(src, []AreaRow{{ID: "id-" + src, Area: "east", Total: 1}}); err != nil {
+	srcs := []string{"2026/07/02", "../../evil", "", ".", ".."}
+	for i, src := range srcs {
+		if err := table.Import(src, []AreaRow{{ID: fmt.Sprintf("id-%d", i), Area: "east", Total: 1}}); err != nil {
 			t.Fatalf("import %q: %v", src, err)
 		}
 	}
@@ -340,7 +342,40 @@ func TestImportSourceSanitized(t *testing.T) {
 	)).Scan(&n); err != nil {
 		t.Fatalf("query merged: %v", err)
 	}
-	if n != 3 {
-		t.Fatalf("merged rows = %d, want 3", n)
+	if n != int64(len(srcs)) {
+		t.Fatalf("merged rows = %d, want %d", n, len(srcs))
+	}
+}
+
+// TestUpsertSkipsEmptyStrings pins the zero-values-are-absent contract for
+// Upsert string fields: an empty string is "no new information", not an
+// overwrite, matching Import.
+func TestUpsertSkipsEmptyStrings(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+
+	if err := table.Upsert("u", []RawRecord{{"id": "x", "name": "keep-me", "total": int64(1)}}); err != nil {
+		t.Fatalf("upsert 1: %v", err)
+	}
+	if err := table.Upsert("u", []RawRecord{{"id": "x", "name": "", "total": int64(1)}}); err != nil {
+		t.Fatalf("upsert 2: %v", err)
+	}
+
+	queryDB := openQueryDB(t)
+	defer queryDB.Close()
+	var name string
+	var total int64
+	if err := queryDB.QueryRow(fmt.Sprintf(
+		`SELECT name, total FROM read_parquet([%s], union_by_name=true) WHERE id='x'`,
+		buildFileList(listParquetFiles(table.mainDir())),
+	)).Scan(&name, &total); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if name != "keep-me" || total != 2 {
+		t.Fatalf("row = (%q, %d), want (\"keep-me\", 2): empty string overwrote existing value", name, total)
 	}
 }

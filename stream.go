@@ -55,8 +55,16 @@ type partitionBuffer struct {
 // replaced with "default" for the same reason.
 func (t *Table[T]) NewImportWriter(source string, opts ImportOptions) *ImportWriter[T] {
 	source = encodePartitionValue(source)
-	if source == "" {
+	switch source {
+	case "":
 		source = "default"
+	case ".":
+		// filepath.Join elides "." (dropping the source level merge expects)
+		// and collapses ".." (escaping inc/<table>), so encode bare dot
+		// segments the same way separators are encoded.
+		source = "%2E"
+	case "..":
+		source = "%2E%2E"
 	}
 	return &ImportWriter[T]{
 		table:  t,
