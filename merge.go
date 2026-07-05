@@ -3,7 +3,6 @@ package fold
 import (
 	"database/sql"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -42,9 +41,9 @@ func (t *Table[T]) mergePartitioned() error {
 		return nil
 	}
 
-	log.Printf("[Fold] %s: found %d partitions to merge", schema.Name, len(partDirs))
+	t.db.logf("[Fold] %s: found %d partitions to merge", schema.Name, len(partDirs))
 
-	errs := runPartitionJobs(schema.Name, t.db.compact.Workers, partDirs, t.mergeOnePartition)
+	errs := t.db.runPartitionJobs(schema.Name, partDirs, t.mergeOnePartition)
 
 	cleanIncLeftovers(t.incDir())
 
@@ -52,13 +51,14 @@ func (t *Table[T]) mergePartitioned() error {
 		return fmt.Errorf("some partitions failed: %s", strings.Join(errs, "; "))
 	}
 
-	log.Printf("[Fold] %s: %d partitions merged", schema.Name, len(partDirs))
+	t.db.logf("[Fold] %s: %d partitions merged", schema.Name, len(partDirs))
 	return nil
 }
 
 // runPartitionJobs runs fn over parts with a bounded worker pool, logging each
 // failure as it happens and returning one "part: err" entry per failure.
-func runPartitionJobs(name string, workers int, parts []string, fn func(string) error) []string {
+func (db *DB) runPartitionJobs(name string, parts []string, fn func(string) error) []string {
+	workers := db.compact.Workers
 	if workers > len(parts) {
 		workers = len(parts)
 	}
@@ -92,7 +92,7 @@ func runPartitionJobs(name string, workers int, parts []string, fn func(string) 
 	var errs []string
 	for r := range results {
 		if r.err != nil {
-			log.Printf("[Fold] %s partition %s failed: %v", name, r.part, r.err)
+			db.logf("[Fold] %s partition %s failed: %v", name, r.part, r.err)
 			errs = append(errs, fmt.Sprintf("%s: %v", r.part, r.err))
 		}
 	}
@@ -134,7 +134,7 @@ func (t *Table[T]) mergeFull() error {
 
 	cleanIncLeftovers(t.incDir())
 
-	log.Printf("[Fold] %s: merge complete", t.schema.Name)
+	t.db.logf("[Fold] %s: merge complete", t.schema.Name)
 	return nil
 }
 
@@ -325,13 +325,14 @@ func segmentFileName(unixMilli int64) string {
 	return fmt.Sprintf("merged_%d_%s.parquet", unixMilli, uuid.New())
 }
 
-// maybeAddBloom rewrites the staged file with bloom filters unless they are
-// disabled or the output is large enough that the whole-file rewrite would risk
-// memory pressure. Bloom filters only accelerate primary-key lookups; they are
-// never required for correctness, so skipping them is always safe.
+// maybeAddBloom rewrites the staged file with bloom filters unless the schema
+// has no bloom columns, they are disabled, or the output is large enough that
+// the whole-file rewrite would risk memory pressure. Bloom filters only
+// accelerate primary-key lookups; they are never required for correctness, so
+// skipping them is always safe.
 func (t *Table[T]) maybeAddBloom(path string) error {
 	opts := t.db.compact
-	if opts.DisableBloom {
+	if opts.DisableBloom || len(t.schema.BloomColumns()) == 0 {
 		return nil
 	}
 	info, err := os.Stat(path)
@@ -339,7 +340,7 @@ func (t *Table[T]) maybeAddBloom(path string) error {
 		return err
 	}
 	if info.Size() > opts.BloomMaxFileBytes {
-		log.Printf("[Fold] %s: skipping bloom rewrite for %d-byte output (limit %d)", t.schema.Name, info.Size(), opts.BloomMaxFileBytes)
+		t.db.logf("[Fold] %s: skipping bloom rewrite for %d-byte output (limit %d)", t.schema.Name, info.Size(), opts.BloomMaxFileBytes)
 		return nil
 	}
 	// Serialize the whole-file rewrite so concurrent partition workers don't load

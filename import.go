@@ -349,12 +349,7 @@ func appendValue(builder array.Builder, f Field, val any) {
 // addBloomFilters rewrites a DuckDB-produced Parquet file with Arrow bloom filters.
 // It runs only when the schema contains bloom-enabled fields.
 func addBloomFilters(path string, schema *Schema) error {
-	var bloomCols []string
-	for _, f := range schema.Fields {
-		if f.Bloom {
-			bloomCols = append(bloomCols, f.Column)
-		}
-	}
+	bloomCols := schema.BloomColumns()
 	if len(bloomCols) == 0 {
 		return nil
 	}

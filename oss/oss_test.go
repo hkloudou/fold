@@ -45,6 +45,22 @@ func TestKeyMappingNoPrefix(t *testing.T) {
 	}
 }
 
+// TestPathForPrefixNotGreedy pins the prefix strip to whole path segments: a
+// key that merely starts with the prefix string ("folder/x" vs prefix "fold")
+// must not lose characters.
+func TestPathForPrefixNotGreedy(t *testing.T) {
+	st := NewFromClient(nil, "bucket", "/data/fold", "fold")
+	if got := st.pathFor("fold/main/t/x.parquet"); got != filepath.FromSlash("/data/fold/main/t/x.parquet") {
+		t.Fatalf("prefixed key mapped to %q", got)
+	}
+	if got := st.pathFor("folder/main/t/x.parquet"); got != filepath.FromSlash("/data/fold/folder/main/t/x.parquet") {
+		t.Fatalf("sibling key mangled: %q", got)
+	}
+	if got := st.pathFor("fold"); got != filepath.FromSlash("/data/fold") {
+		t.Fatalf("prefix root mapped to %q", got)
+	}
+}
+
 func TestKeyForRejectsOutsideRoot(t *testing.T) {
 	st := NewFromClient(nil, "bucket", "/data/fold", "")
 	if _, err := st.keyFor("/etc/passwd"); err == nil {

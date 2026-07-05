@@ -93,7 +93,12 @@ The resulting guarantees:
 
 - **Crash-safe.** Output is staged and validated before the manifest references
   it. A crash before the commit leaves the previous state authoritative; the
-  orphaned output is garbage-collected on the next run.
+  orphaned output is garbage-collected on the next run. The commit itself is
+  durable against power loss, not just process crashes: segments, manifests,
+  and the directories that hold them are fsynced before the consumed `inc/`
+  inputs are deleted. (Freshly imported `inc/` files are deliberately not
+  fsynced — losing power right after an import can leave a truncated inc file
+  that the next merge rejects loudly; re-import and retry.)
 - **Retry-idempotent.** Consumed `inc/` inputs are recorded and removed before
   the next publish, so aggregates such as `sum` are never double-applied.
 - **Simple reads.** Active files are primary-key-disjoint, so a read is a plain
@@ -114,8 +119,8 @@ Declare strategies with the `bd` struct tag.
 | --- | --- |
 | `pk` | Primary key. Multiple fields create a composite key. |
 | `bloom` | Enable Parquet bloom filters for the column. |
-| `partition:p=[0:2]` | Partition by substring slice. |
-| `partition:b=hash(256)` | Partition by hash bucket. |
+| `partition:p=[0:2]` | Partition by substring slice (`end > start` required). |
+| `partition:b=hash(256)` | Partition by hash bucket (1–65536 buckets). |
 | `column:name` | Override the default snake_case column name. |
 | `-` | Skip the field. |
 | `coalesce` | Use the incoming non-null value, otherwise keep existing value. |
@@ -138,6 +143,15 @@ for reads, but new imports of the same logical value will target the encoded
 directory name. Rename such directories to their encoded form (or re-import
 into a fresh dataset) before mixing old and new writers, so one primary key
 does not end up active in two partition directories.
+
+### Schema evolution
+
+The registered struct is authoritative for what a compaction writes. Adding a
+field is safe: old files simply lack the column, and merges treat it as
+absent. **Removing a field drops that column from a partition's output at its
+next compaction** — that is also the supported way to delete a column. Rename
+a column only via an explicit `column:` tag override that preserves the old
+name; otherwise a rename is a drop plus an add.
 
 ### Zero values are treated as absent
 
@@ -213,6 +227,14 @@ Bloom filters only accelerate primary-key lookups; they are never required for
 correctness. The post-merge rewrite is skipped automatically for outputs larger
 than `BloomMaxFileBytes` (default 256 MiB) to bound its memory, and can be
 turned off entirely with `DisableBloom`.
+
+Progress messages go to the standard library's global logger by default.
+Route them elsewhere — or silence them — with `WithLogger`:
+
+```go
+db, _ := fold.Open("./data", fold.WithLogger(nil)) // silent
+db, _ := fold.Open("./data", fold.WithLogger(log.New(w, "", log.LstdFlags)))
+```
 
 ## Streaming import
 

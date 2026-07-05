@@ -3,6 +3,7 @@ package fold
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -23,13 +24,14 @@ func JSON(v any) string {
 
 // DB is the root Fold handle, similar in spirit to gorm.DB.
 type DB struct {
-	dir         string             // data root directory
-	tables      map[string]*Schema // registered table schemas
-	compact     CompactOptions     // merge/upsert worker and DuckDB execution tuning
-	storage     Storage            // metadata + object persistence (default: local filesystem)
-	bloomMu     sync.Mutex         // serializes whole-file bloom rewrites across concurrent workers
-	partLocks   sync.Map           // partition dir -> *sync.Mutex; serializes publishes per partition
-	liveStaging sync.Map           // staging dir -> struct{}; in-flight upsert inputs the stale sweep must skip
+	dir         string               // data root directory
+	tables      map[string]*Schema   // registered table schemas
+	compact     CompactOptions       // merge/upsert worker and DuckDB execution tuning
+	storage     Storage              // metadata + object persistence (default: local filesystem)
+	logf        func(string, ...any) // progress logging sink (default: log.Printf)
+	bloomMu     sync.Mutex           // serializes whole-file bloom rewrites across concurrent workers
+	partLocks   sync.Map             // partition dir -> *sync.Mutex; serializes publishes per partition
+	liveStaging sync.Map             // staging dir -> struct{}; in-flight upsert inputs the stale sweep must skip
 	mu          sync.RWMutex
 }
 
@@ -109,6 +111,25 @@ func WithStorage(s Storage) Option {
 	return func(db *DB) { db.storage = s }
 }
 
+// Logger is the minimal logging contract Fold needs for merge/upsert progress
+// messages. *log.Logger satisfies it.
+type Logger interface {
+	Printf(format string, v ...any)
+}
+
+// WithLogger routes Fold's progress logging through l. Passing nil silences
+// it entirely. The default logs through the standard library's global logger,
+// matching previous behavior.
+func WithLogger(l Logger) Option {
+	return func(db *DB) {
+		if l == nil {
+			db.logf = func(string, ...any) {}
+		} else {
+			db.logf = l.Printf
+		}
+	}
+}
+
 // Open initializes a data root and creates inc/ and main/ subdirectories.
 func Open(dir string, opts ...Option) (*DB, error) {
 	for _, sub := range []string{"inc", "main"} {
@@ -132,6 +153,9 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	if db.storage == nil {
 		db.storage = localStorage{}
 	}
+	if db.logf == nil {
+		db.logf = log.Printf
+	}
 	return db, nil
 }
 
@@ -151,7 +175,10 @@ type Table[T any] struct {
 	schema *Schema
 }
 
-// Register parses a struct type into a Schema and returns a typed Table handle.
+// Register parses a struct type into a Schema and returns a typed Table
+// handle. It panics if the struct cannot be parsed (missing pk, unsupported
+// field type, malformed bd tag): a schema error is a programming error, and
+// panicking surfaces it at startup rather than corrupting data later.
 func Register[T any](db *DB) *Table[T] {
 	schema, err := parseSchema[T]()
 	if err != nil {

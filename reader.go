@@ -2,7 +2,6 @@ package fold
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -54,23 +53,15 @@ func (r RawRecord) StrList(field string) []string {
 	}
 }
 
-// Int64 returns an int64 value.
+// Int64 returns an int64 value. It accepts the same shapes Upsert coerces
+// (int64, int, float64, json.Number, decimal string), so a helper read and a
+// stored value can never disagree.
 func (r RawRecord) Int64(field string) int64 {
 	v, ok := r[field]
 	if !ok || v == nil {
 		return 0
 	}
-	switch n := v.(type) {
-	case int64:
-		return n
-	case float64:
-		return int64(n)
-	case json.Number:
-		i, _ := n.Int64()
-		return i
-	default:
-		return 0
-	}
+	return coerceInt64(v)
 }
 
 // regexCache holds compiled patterns for Match, which is typically called
