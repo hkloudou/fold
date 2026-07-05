@@ -3,7 +3,6 @@ package fold
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -44,7 +43,7 @@ func (t *Table[T]) Upsert(source string, records []RawRecord) error {
 	if err := t.upsertRows(t.mainDir(), rows); err != nil {
 		return fmt.Errorf("fold: upsert: %w", err)
 	}
-	log.Printf("[Fold] %s: upsert complete (%d records)", schema.Name, len(rows))
+	t.db.logf("[Fold] %s: upsert complete (%d records)", schema.Name, len(rows))
 	return nil
 }
 
@@ -56,7 +55,7 @@ func (t *Table[T]) upsertPartitioned(rows []map[string]any) error {
 		return nil
 	}
 
-	log.Printf("[Fold] %s: upsert %d partitions", schema.Name, len(groups))
+	t.db.logf("[Fold] %s: upsert %d partitions", schema.Name, len(groups))
 
 	parts := make([]string, 0, len(groups))
 	for p := range groups {
@@ -64,7 +63,7 @@ func (t *Table[T]) upsertPartitioned(rows []map[string]any) error {
 	}
 	sort.Strings(parts)
 
-	errs := runPartitionJobs(schema.Name, t.db.compact.Workers, parts, func(partDir string) error {
+	errs := t.db.runPartitionJobs(schema.Name, parts, func(partDir string) error {
 		mainPartDir := filepath.Join(t.mainDir(), partDir)
 		if err := mkdirAllDurable(mainPartDir, t.db.dir); err != nil {
 			return err
@@ -76,7 +75,7 @@ func (t *Table[T]) upsertPartitioned(rows []map[string]any) error {
 		return fmt.Errorf("some partitions failed during upsert: %s", strings.Join(errs, "; "))
 	}
 
-	log.Printf("[Fold] %s: %d partitions upserted", schema.Name, len(groups))
+	t.db.logf("[Fold] %s: %d partitions upserted", schema.Name, len(groups))
 	return nil
 }
 

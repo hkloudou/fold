@@ -93,6 +93,17 @@ func (s *Schema) PKColumns() []string {
 	return cols
 }
 
+// BloomColumns returns the columns with Parquet bloom filters enabled.
+func (s *Schema) BloomColumns() []string {
+	var cols []string
+	for _, f := range s.Fields {
+		if f.Bloom {
+			cols = append(cols, f.Column)
+		}
+	}
+	return cols
+}
+
 var schemaCache sync.Map
 
 // TableNamer lets a struct override the default table name.
@@ -254,10 +265,22 @@ func parseField(sf reflect.StructField, index int) (*Field, error) {
 	return field, nil
 }
 
+// tagHasSegment reports whether one semicolon-separated segment of a bd tag
+// equals want exactly. A plain strings.Contains would false-positive on
+// segments that merely embed the word, e.g. column:json_merge_count.
+func tagHasSegment(tag, want string) bool {
+	for _, part := range strings.Split(tag, ";") {
+		if strings.TrimSpace(part) == want {
+			return true
+		}
+	}
+	return false
+}
+
 // detectFieldType infers the Parquet storage type from a Go type.
 func detectFieldType(t reflect.Type, tag string) (FieldType, error) {
 	// json_merge fields are stored as VARCHAR.
-	if strings.Contains(tag, "json_merge") {
+	if tagHasSegment(tag, "json_merge") {
 		return FieldString, nil
 	}
 
@@ -286,7 +309,15 @@ var (
 	partDirectRe = regexp.MustCompile(`^(\w+)$`)                 // area
 )
 
+// maxHashBuckets caps partition:k=hash(n): the bucket is derived from two
+// bytes of the value's SHA-256, so counts beyond 65536 would silently leave
+// buckets unreachable.
+const maxHashBuckets = 1 << 16
+
 // parsePartitionTag parses expressions such as partition:p=[2:4],a=[4:8].
+// Malformed rules are rejected here — evalPartition runs per imported row and
+// must never be the place a typo surfaces (a reversed slice would panic there,
+// and hash(0) would silently degrade to direct-value partitioning).
 func parsePartitionTag(expr string, fieldName string) ([]PartitionRule, error) {
 	var rules []PartitionRule
 	for _, seg := range strings.Split(expr, ",") {
@@ -298,6 +329,9 @@ func parsePartitionTag(expr string, fieldName string) ([]PartitionRule, error) {
 		if m := partSliceRe.FindStringSubmatch(seg); m != nil {
 			start, _ := strconv.Atoi(m[2])
 			end, _ := strconv.Atoi(m[3])
+			if end <= start {
+				return nil, fmt.Errorf("partition slice %q must have end > start", seg)
+			}
 			rules = append(rules, PartitionRule{
 				Key:   m[1],
 				Field: fieldName,
@@ -305,6 +339,9 @@ func parsePartitionTag(expr string, fieldName string) ([]PartitionRule, error) {
 			})
 		} else if m := partHashRe.FindStringSubmatch(seg); m != nil {
 			n, _ := strconv.Atoi(m[2])
+			if n < 1 || n > maxHashBuckets {
+				return nil, fmt.Errorf("partition hash bucket count in %q must be in [1, %d]", seg, maxHashBuckets)
+			}
 			rules = append(rules, PartitionRule{
 				Key:   m[1],
 				Field: fieldName,

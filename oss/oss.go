@@ -136,10 +136,19 @@ func (s *Storage) keyFor(p string) (string, error) {
 	return path.Join(s.prefix, filepath.ToSlash(rel)), nil
 }
 
-// pathFor maps an object key back to the local-style path Fold expects.
+// pathFor maps an object key back to the local-style path Fold expects. Only
+// keys at or under the prefix are stripped: trimming the bare prefix string
+// would also mangle a sibling key that merely starts with it ("fold" vs
+// "folder/x").
 func (s *Storage) pathFor(key string) string {
-	rel := strings.TrimPrefix(key, s.prefix)
-	rel = strings.TrimPrefix(rel, "/")
+	rel := key
+	if s.prefix != "" {
+		if key == s.prefix {
+			rel = ""
+		} else {
+			rel = strings.TrimPrefix(key, s.prefix+"/")
+		}
+	}
 	return filepath.Join(s.root, filepath.FromSlash(rel))
 }
 
