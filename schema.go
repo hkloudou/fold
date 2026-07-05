@@ -57,9 +57,11 @@ type Field struct {
 
 // GetSQLExpr returns the SQL expression used during FULL OUTER JOIN merge.
 // Custom MergeExpr takes precedence over the built-in strategy expression.
+// {} expands to the quoted column name, so exprs like "COALESCE(s.{}, t.{})"
+// stay valid for reserved-word columns.
 func (f *Field) GetSQLExpr() string {
 	if f.MergeExpr != "" {
-		return strings.ReplaceAll(f.MergeExpr, "{}", f.Column)
+		return strings.ReplaceAll(f.MergeExpr, "{}", sqlIdent(f.Column))
 	}
 	return f.Strategy.SQLExpr(f.Column)
 }
@@ -68,7 +70,7 @@ func (f *Field) GetSQLExpr() string {
 // Custom AggExpr takes precedence over the built-in strategy expression.
 func (f *Field) GetAggExpr() string {
 	if f.AggExpr != "" {
-		return strings.ReplaceAll(f.AggExpr, "{}", f.Column) + " AS " + f.Column
+		return strings.ReplaceAll(f.AggExpr, "{}", sqlIdent(f.Column)) + " AS " + sqlIdent(f.Column)
 	}
 	return f.Strategy.IncAggExpr(f.Column)
 }
@@ -234,7 +236,11 @@ func parseField(sf reflect.StructField, index int) (*Field, error) {
 			}
 			field.Partition = rules
 		case strings.HasPrefix(part, "column:"):
-			field.Column = part[len("column:"):]
+			name := part[len("column:"):]
+			if name == "" {
+				return nil, fmt.Errorf("empty column name in bd tag %q", part)
+			}
+			field.Column = name
 		default:
 			return nil, fmt.Errorf("unknown bd tag: %q", part)
 		}
@@ -345,40 +351,45 @@ func toSnakeCase(s string) string {
 }
 
 // SQLExpr returns the DuckDB SQL expression for inc/main FULL OUTER JOIN merge.
-// s = inc_merged (new data), t = main (existing data).
+// s = inc_merged (new data), t = main (existing data). The column name is
+// interpolated quoted, so reserved words cannot break the statement.
 func (s Strategy) SQLExpr(field string) string {
+	q := sqlIdent(field)
 	switch s {
 	case StrategyPK:
-		return fmt.Sprintf("COALESCE(s.%s, t.%s)", field, field)
+		return fmt.Sprintf("COALESCE(s.%s, t.%s)", q, q)
 	case StrategyCoalesce:
-		return fmt.Sprintf("COALESCE(s.%s, t.%s)", field, field)
+		return fmt.Sprintf("COALESCE(s.%s, t.%s)", q, q)
 	case StrategyListUnion:
-		return fmt.Sprintf("list_distinct(list_cat(COALESCE(CAST(t.%s AS VARCHAR[]), []), COALESCE(CAST(s.%s AS VARCHAR[]), [])))", field, field)
+		return fmt.Sprintf("list_distinct(list_cat(COALESCE(CAST(t.%s AS VARCHAR[]), []), COALESCE(CAST(s.%s AS VARCHAR[]), [])))", q, q)
 	case StrategyOverwrite:
-		return fmt.Sprintf("COALESCE(s.%s, t.%s)", field, field)
+		return fmt.Sprintf("COALESCE(s.%s, t.%s)", q, q)
 	case StrategyJSONMerge:
 		// RFC7396: json_merge_patch(old, new)
-		return fmt.Sprintf("CASE WHEN s.%[1]s IS NOT NULL AND t.%[1]s IS NOT NULL THEN json_merge_patch(t.%[1]s::JSON, s.%[1]s::JSON)::VARCHAR WHEN s.%[1]s IS NOT NULL THEN s.%[1]s ELSE t.%[1]s END", field)
+		return fmt.Sprintf("CASE WHEN s.%[1]s IS NOT NULL AND t.%[1]s IS NOT NULL THEN json_merge_patch(t.%[1]s::JSON, s.%[1]s::JSON)::VARCHAR WHEN s.%[1]s IS NOT NULL THEN s.%[1]s ELSE t.%[1]s END", q)
 	case StrategyMax:
-		return fmt.Sprintf("GREATEST(s.%s, t.%s)", field, field)
+		return fmt.Sprintf("GREATEST(s.%s, t.%s)", q, q)
 	case StrategyMin:
-		return fmt.Sprintf("LEAST(s.%s, t.%s)", field, field)
+		return fmt.Sprintf("LEAST(s.%s, t.%s)", q, q)
 	case StrategySum:
-		return fmt.Sprintf("COALESCE(s.%s, 0) + COALESCE(t.%s, 0)", field, field)
+		return fmt.Sprintf("COALESCE(s.%s, 0) + COALESCE(t.%s, 0)", q, q)
 	default:
-		return fmt.Sprintf("COALESCE(s.%s, t.%s)", field, field)
+		return fmt.Sprintf("COALESCE(s.%s, t.%s)", q, q)
 	}
 }
 
 // IncAggExpr returns the GROUP BY aggregation expression for inc pre-merge.
+// The column name is interpolated quoted, so reserved words cannot break the
+// statement.
 func (s Strategy) IncAggExpr(field string) string {
+	q := sqlIdent(field)
 	switch s {
 	case StrategyListUnion:
-		return fmt.Sprintf("list_distinct(flatten(list(%s))) AS %s", field, field)
+		return fmt.Sprintf("list_distinct(flatten(list(%s))) AS %s", q, q)
 	case StrategyOverwrite:
-		return fmt.Sprintf("MAX(%s) AS %s", field, field)
+		return fmt.Sprintf("MAX(%s) AS %s", q, q)
 	case StrategyCoalesce:
-		return fmt.Sprintf("COALESCE(MAX(%s), FIRST(%s)) AS %s", field, field, field)
+		return fmt.Sprintf("COALESCE(MAX(%s), FIRST(%s)) AS %s", q, q, q)
 	case StrategyJSONMerge:
 		// Fold every patch for the primary key (RFC 7396) instead of keeping an
 		// arbitrary one as ANY_VALUE did, which silently dropped patches.
@@ -387,14 +398,14 @@ func (s Strategy) IncAggExpr(field string) string {
 		// patch win — a stable tie-break, not a temporal one, because Fold keeps
 		// no per-row sequence within a batch. Temporal precedence (a later merge
 		// wins) is applied across merge cycles by GetSQLExpr. NULLs are skipped.
-		return fmt.Sprintf("CAST(list_reduce(list(CAST(%[1]s AS JSON) ORDER BY %[1]s) FILTER (WHERE %[1]s IS NOT NULL), (a, b) -> json_merge_patch(a, b)) AS VARCHAR) AS %[1]s", field)
+		return fmt.Sprintf("CAST(list_reduce(list(CAST(%[1]s AS JSON) ORDER BY %[1]s) FILTER (WHERE %[1]s IS NOT NULL), (a, b) -> json_merge_patch(a, b)) AS VARCHAR) AS %[1]s", q)
 	case StrategyMax:
-		return fmt.Sprintf("MAX(%s) AS %s", field, field)
+		return fmt.Sprintf("MAX(%s) AS %s", q, q)
 	case StrategyMin:
-		return fmt.Sprintf("MIN(%s) AS %s", field, field)
+		return fmt.Sprintf("MIN(%s) AS %s", q, q)
 	case StrategySum:
-		return fmt.Sprintf("SUM(%s) AS %s", field, field)
+		return fmt.Sprintf("SUM(%s) AS %s", q, q)
 	default:
-		return fmt.Sprintf("MAX(%s) AS %s", field, field)
+		return fmt.Sprintf("MAX(%s) AS %s", q, q)
 	}
 }

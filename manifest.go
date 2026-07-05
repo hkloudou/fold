@@ -86,8 +86,12 @@ func readCommit(st Storage, dir, txID string) (*commitRecord, error) {
 	return &c, nil
 }
 
-// writeJSONAtomic writes v as JSON to a temp file then renames it into place. It
-// is the local filesystem's atomic write primitive (see localStorage.WriteJSON).
+// writeJSONAtomic writes v as JSON to a temp file, fsyncs it, then renames it
+// into place. It is the local filesystem's atomic write primitive (see
+// localStorage.WriteJSON). The fsync makes the content durable before the
+// rename can expose it: without it, a power loss can leave a visible but
+// truncated manifest as the partition's commit point — a process crash alone
+// never does, but "crash-safe" should not stop at process crashes.
 func writeJSONAtomic(path string, v any) error {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -97,12 +101,66 @@ func writeJSONAtomic(path string, v any) error {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
 		return err
+	}
+	// Make the rename itself durable before the caller acts on it. This
+	// matters most for the manifest commit: consumed inc files are deleted
+	// right after, and if power loss rolled the rename back afterwards, the
+	// old manifest would resurrect while the data's only other copy (the inc
+	// files) is already gone. Best-effort because directory fsync is
+	// unsupported on some platforms (e.g. Windows); the content fsync above
+	// is the consistency-critical one.
+	syncDir(filepath.Dir(path))
+	return nil
+}
+
+// syncDir best-effort fsyncs a directory so completed renames in it survive
+// power loss. See writeJSONAtomic for why errors are ignored.
+func syncDir(dir string) {
+	if d, err := os.Open(dir); err == nil {
+		d.Sync()
+		d.Close()
+	}
+}
+
+// mkdirAllDurable creates dir (and parents) like os.MkdirAll, then fsyncs the
+// directory chain from dir up to stopAt (inclusive). POSIX makes a created
+// directory durable only once its parent is fsynced, so without this a first
+// publish into a brand-new table/partition directory could commit, delete the
+// consumed inc files, and still lose the whole directory — manifest, segment
+// and all — to a power loss. The publish path calls this before any commit so
+// consumed inc is only ever deleted under a durable directory chain. Directory
+// fsync itself is best-effort (see writeJSONAtomic).
+func mkdirAllDurable(dir, stopAt string) error {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	stopAt = filepath.Clean(stopAt)
+	for d := filepath.Clean(dir); ; d = filepath.Dir(d) {
+		syncDir(d)
+		if d == stopAt || d == filepath.Dir(d) {
+			break
+		}
 	}
 	return nil
 }

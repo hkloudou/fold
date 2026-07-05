@@ -31,9 +31,11 @@ func (t *Table[T]) Upsert(source string, records []RawRecord) error {
 		return nil
 	}
 
-	if err := os.MkdirAll(t.mainDir(), 0755); err != nil {
+	if err := mkdirAllDurable(t.mainDir(), t.db.dir); err != nil {
 		return err
 	}
+
+	t.db.cleanStaleStaging()
 
 	if len(schema.Partitions) > 0 {
 		return t.upsertPartitioned(rows)
@@ -64,7 +66,7 @@ func (t *Table[T]) upsertPartitioned(rows []map[string]any) error {
 
 	errs := runPartitionJobs(schema.Name, t.db.compact.Workers, parts, func(partDir string) error {
 		mainPartDir := filepath.Join(t.mainDir(), partDir)
-		if err := os.MkdirAll(mainPartDir, 0755); err != nil {
+		if err := mkdirAllDurable(mainPartDir, t.db.dir); err != nil {
 			return err
 		}
 		return t.upsertRows(mainPartDir, groups[partDir])
@@ -84,7 +86,14 @@ func (t *Table[T]) upsertPartitioned(rows []map[string]any) error {
 // not recorded as consumed inputs — they are removed here, crash or not, and
 // a crashed upsert is simply retried by the caller.
 func (t *Table[T]) upsertRows(dir string, rows []map[string]any) error {
-	staging := filepath.Join(t.db.dir, ".staging", "upsert_"+uuid.New().String())
+	staging := filepath.Join(t.db.dir, stagingDirName, "upsert_"+uuid.New().String())
+	// Register before the directory exists so the stale-staging sweep can
+	// never observe it unregistered: age alone must not decide liveness,
+	// because a compaction blocked on a partition lock can legitimately
+	// outlive any threshold. Deregistration is the last deferred step, after
+	// the directory is already removed.
+	t.db.liveStaging.Store(staging, struct{}{})
+	defer t.db.liveStaging.Delete(staging)
 	if err := writeParquet(staging, t.schema, rows); err != nil {
 		os.RemoveAll(staging)
 		return fmt.Errorf("write staging: %w", err)

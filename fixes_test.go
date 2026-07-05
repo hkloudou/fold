@@ -347,6 +347,162 @@ func TestImportSourceSanitized(t *testing.T) {
 	}
 }
 
+// ReservedWordRow uses SQL reserved words as field names — realistic schema
+// vocabulary (orders, from/to ranges, groups) that the generated merge SQL
+// used to interpolate unquoted, producing DuckDB parser errors.
+type ReservedWordRow struct {
+	ID    string `bd:"pk"`
+	Order int64  `bd:"max"`
+	From  string
+	To    string `bd:"overwrite"`
+	Group []string
+}
+
+// TestReservedWordColumns proves reserved-word column names survive the whole
+// life cycle: import → first merge (agg only), re-merge (FULL OUTER JOIN with
+// main), and upsert.
+func TestReservedWordColumns(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[ReservedWordRow](db)
+
+	if err := table.Import("s", []ReservedWordRow{
+		{ID: "x", Order: 5, From: "a", To: "b", Group: []string{"g1"}},
+	}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("first merge: %v", err)
+	}
+
+	if err := table.Import("s", []ReservedWordRow{
+		{ID: "x", Order: 9, Group: []string{"g2"}},
+	}); err != nil {
+		t.Fatalf("import 2: %v", err)
+	}
+	if err := table.Merge(); err != nil {
+		t.Fatalf("re-merge over main: %v", err)
+	}
+
+	if err := table.Upsert("u", []RawRecord{{"id": "x", "to": "c"}}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	queryDB := openQueryDB(t)
+	defer queryDB.Close()
+	var order int64
+	var from, to, group string
+	if err := queryDB.QueryRow(fmt.Sprintf(
+		`SELECT "order", "from", "to", CAST("group" AS VARCHAR) FROM read_parquet([%s], union_by_name=true) WHERE id='x'`,
+		buildFileList(listParquetFiles(table.mainDir())),
+	)).Scan(&order, &from, &to, &group); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if order != 9 || from != "a" || to != "c" {
+		t.Fatalf("row = (%d, %q, %q), want (9, \"a\", \"c\")", order, from, to)
+	}
+	for _, g := range []string{"g1", "g2"} {
+		if !strings.Contains(group, g) {
+			t.Fatalf("group missing %s: %s", g, group)
+		}
+	}
+}
+
+func TestSQLIdent(t *testing.T) {
+	if got := sqlIdent("order"); got != `"order"` {
+		t.Fatalf("sqlIdent(order) = %s", got)
+	}
+	if got := sqlIdent(`we"ird`); got != `"we""ird"` {
+		t.Fatalf("embedded quote not escaped: %s", got)
+	}
+}
+
+type EmptyColumnRow struct {
+	ID string `bd:"pk;column:"`
+}
+
+func TestEmptyColumnTagRejected(t *testing.T) {
+	if _, err := parseSchema[EmptyColumnRow](); err == nil {
+		t.Fatal("empty column: tag should be rejected")
+	}
+}
+
+// TestSegmentFileNamesUnique pins the publish-name contract: the same wall
+// clock must never produce the same segment name, so a publish can never
+// overwrite the still-active previous file outside the manifest commit.
+func TestSegmentFileNamesUnique(t *testing.T) {
+	a, b := segmentFileName(42), segmentFileName(42)
+	if a == b {
+		t.Fatalf("same-millisecond publishes collide: %s", a)
+	}
+	for _, n := range []string{a, b} {
+		if !strings.HasPrefix(n, "merged_42_") || !strings.HasSuffix(n, ".parquet") {
+			t.Fatalf("unexpected segment name shape: %s", n)
+		}
+	}
+}
+
+// TestStaleUpsertStagingGC verifies merge sweeps crash-abandoned upsert
+// staging directories (nothing else covers them) while leaving both anything
+// young enough to belong to a live upsert AND anything registered as an
+// in-flight upsert of this handle — however old — untouched. Age alone must
+// not decide liveness: an upsert blocked on a partition lock can legitimately
+// outlive the threshold.
+func TestStaleUpsertStagingGC(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	table := Register[MergeRow](db)
+
+	root := filepath.Join(db.Dir(), stagingDirName)
+	stale := filepath.Join(root, "upsert_dead")
+	fresh := filepath.Join(root, "upsert_live")
+	blocked := filepath.Join(root, "upsert_blocked") // in-flight but older than the threshold
+	for _, d := range []string{stale, fresh, blocked} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "x.parquet"), []byte("stub"), 0644); err != nil {
+			t.Fatalf("seed %s: %v", d, err)
+		}
+	}
+	old := time.Now().Add(-2 * staleStagingAge)
+	for _, d := range []string{stale, blocked} {
+		if err := os.Chtimes(d, old, old); err != nil {
+			t.Fatalf("age staging %s: %v", d, err)
+		}
+	}
+	db.liveStaging.Store(blocked, struct{}{})
+
+	if err := table.Merge(); err != nil { // no inc data; the sweep still runs
+		t.Fatalf("merge: %v", err)
+	}
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatal("stale upsert staging was not garbage-collected")
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("fresh staging of a possibly-live upsert was removed: %v", err)
+	}
+	if _, err := os.Stat(blocked); err != nil {
+		t.Fatalf("registered in-flight staging was removed despite its age: %v", err)
+	}
+
+	// Once deregistered (the upsert finished), age applies again.
+	db.liveStaging.Delete(blocked)
+	if err := table.Merge(); err != nil {
+		t.Fatalf("second merge: %v", err)
+	}
+	if _, err := os.Stat(blocked); !os.IsNotExist(err) {
+		t.Fatal("deregistered stale staging was not garbage-collected")
+	}
+}
+
 // TestUpsertSkipsEmptyStrings pins the zero-values-are-absent contract for
 // Upsert string fields: an empty string is "no new information", not an
 // overwrite, matching Import.
