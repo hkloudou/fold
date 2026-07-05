@@ -446,8 +446,11 @@ func TestSegmentFileNamesUnique(t *testing.T) {
 }
 
 // TestStaleUpsertStagingGC verifies merge sweeps crash-abandoned upsert
-// staging directories (nothing else covers them) while leaving anything young
-// enough to belong to a live upsert untouched.
+// staging directories (nothing else covers them) while leaving both anything
+// young enough to belong to a live upsert AND anything registered as an
+// in-flight upsert of this handle — however old — untouched. Age alone must
+// not decide liveness: an upsert blocked on a partition lock can legitimately
+// outlive the threshold.
 func TestStaleUpsertStagingGC(t *testing.T) {
 	db, err := Open(t.TempDir())
 	if err != nil {
@@ -459,7 +462,8 @@ func TestStaleUpsertStagingGC(t *testing.T) {
 	root := filepath.Join(db.Dir(), stagingDirName)
 	stale := filepath.Join(root, "upsert_dead")
 	fresh := filepath.Join(root, "upsert_live")
-	for _, d := range []string{stale, fresh} {
+	blocked := filepath.Join(root, "upsert_blocked") // in-flight but older than the threshold
+	for _, d := range []string{stale, fresh, blocked} {
 		if err := os.MkdirAll(d, 0755); err != nil {
 			t.Fatalf("mkdir %s: %v", d, err)
 		}
@@ -468,9 +472,12 @@ func TestStaleUpsertStagingGC(t *testing.T) {
 		}
 	}
 	old := time.Now().Add(-2 * staleStagingAge)
-	if err := os.Chtimes(stale, old, old); err != nil {
-		t.Fatalf("age stale staging: %v", err)
+	for _, d := range []string{stale, blocked} {
+		if err := os.Chtimes(d, old, old); err != nil {
+			t.Fatalf("age staging %s: %v", d, err)
+		}
 	}
+	db.liveStaging.Store(blocked, struct{}{})
 
 	if err := table.Merge(); err != nil { // no inc data; the sweep still runs
 		t.Fatalf("merge: %v", err)
@@ -481,6 +488,18 @@ func TestStaleUpsertStagingGC(t *testing.T) {
 	}
 	if _, err := os.Stat(fresh); err != nil {
 		t.Fatalf("fresh staging of a possibly-live upsert was removed: %v", err)
+	}
+	if _, err := os.Stat(blocked); err != nil {
+		t.Fatalf("registered in-flight staging was removed despite its age: %v", err)
+	}
+
+	// Once deregistered (the upsert finished), age applies again.
+	db.liveStaging.Delete(blocked)
+	if err := table.Merge(); err != nil {
+		t.Fatalf("second merge: %v", err)
+	}
+	if _, err := os.Stat(blocked); !os.IsNotExist(err) {
+		t.Fatal("deregistered stale staging was not garbage-collected")
 	}
 }
 

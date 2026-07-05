@@ -23,13 +23,14 @@ func JSON(v any) string {
 
 // DB is the root Fold handle, similar in spirit to gorm.DB.
 type DB struct {
-	dir       string             // data root directory
-	tables    map[string]*Schema // registered table schemas
-	compact   CompactOptions     // merge/upsert worker and DuckDB execution tuning
-	storage   Storage            // metadata + object persistence (default: local filesystem)
-	bloomMu   sync.Mutex         // serializes whole-file bloom rewrites across concurrent workers
-	partLocks sync.Map           // partition dir -> *sync.Mutex; serializes publishes per partition
-	mu        sync.RWMutex
+	dir         string             // data root directory
+	tables      map[string]*Schema // registered table schemas
+	compact     CompactOptions     // merge/upsert worker and DuckDB execution tuning
+	storage     Storage            // metadata + object persistence (default: local filesystem)
+	bloomMu     sync.Mutex         // serializes whole-file bloom rewrites across concurrent workers
+	partLocks   sync.Map           // partition dir -> *sync.Mutex; serializes publishes per partition
+	liveStaging sync.Map           // staging dir -> struct{}; in-flight upsert inputs the stale sweep must skip
+	mu          sync.RWMutex
 }
 
 // lockPartition serializes merge/upsert publishes for one partition directory

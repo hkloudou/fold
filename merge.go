@@ -21,7 +21,7 @@ func (t *Table[T]) Merge() error {
 		return err
 	}
 
-	cleanStaleStaging(t.db.dir)
+	t.db.cleanStaleStaging()
 
 	incFiles := listParquetFiles(t.incDir())
 	if len(incFiles) == 0 {
@@ -524,28 +524,37 @@ func cleanIncLeftovers(dir string) {
 // transient parquet inputs, outside inc/ and main/.
 const stagingDirName = ".staging"
 
-// staleStagingAge is how old an upsert staging directory must be before merge
-// garbage-collects it as a crash leftover. Staging normally lives only for the
-// duration of one upsertRows call and is removed there, crash or not; the
-// generous threshold keeps an unusually slow in-flight compaction's inputs
-// safe. Nothing else covers these directories: they sit outside inc/ and
-// main/, so neither cleanIncLeftovers nor finalizeDir ever sees them.
+// staleStagingAge is how old an upsert staging directory must be before it is
+// garbage-collected as a crash leftover. Age is only the cross-process
+// heuristic: staging that belongs to a live upsert of THIS handle is skipped
+// via db.liveStaging regardless of age (a compaction blocked on a partition
+// lock can legitimately outlive any threshold), and a crashed process's
+// staging is by definition in no registry. Nothing else covers these
+// directories: they sit outside inc/ and main/, so neither cleanIncLeftovers
+// nor finalizeDir ever sees them.
 const staleStagingAge = 24 * time.Hour
 
 // cleanStaleStaging removes upsert staging directories abandoned by a crash.
-func cleanStaleStaging(dbDir string) {
-	root := filepath.Join(dbDir, stagingDirName)
+// Directories registered by an in-flight upsert on this handle are never
+// touched; for anything else the age threshold applies (other live processes
+// are out of scope — Fold documents a single writer per table).
+func (db *DB) cleanStaleStaging() {
+	root := filepath.Join(db.dir, stagingDirName)
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return
 	}
 	cutoff := time.Now().Add(-staleStagingAge)
 	for _, e := range entries {
+		p := filepath.Join(root, e.Name())
+		if _, live := db.liveStaging.Load(p); live {
+			continue
+		}
 		info, err := e.Info()
 		if err != nil || !info.ModTime().Before(cutoff) {
 			continue
 		}
-		os.RemoveAll(filepath.Join(root, e.Name()))
+		os.RemoveAll(p)
 	}
 }
 
