@@ -121,14 +121,37 @@ func (localStorage) UploadFile(localPath, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return err
 	}
+	// The staged content must be durable before it is published: the manifest
+	// commit that follows is fsynced, so after a power loss a durable manifest
+	// could otherwise reference a torn segment whose consumed inc inputs are
+	// already deleted.
+	if err := syncFile(localPath); err != nil {
+		return err
+	}
 	if err := os.Rename(localPath, dst); err == nil {
+		syncDir(filepath.Dir(dst))
 		return nil
 	}
 	// Fall back to copy for cross-device moves.
 	if err := copyFile(localPath, dst); err != nil {
 		return err
 	}
+	syncDir(filepath.Dir(dst))
 	return os.Remove(localPath)
+}
+
+// syncFile fsyncs an existing file's content. It opens read-write because
+// flushing a read-only handle is not permitted on all platforms.
+func syncFile(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 func (localStorage) DownloadFile(src, localPath string) error {
@@ -156,6 +179,11 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	if err := out.Sync(); err != nil {
 		out.Close()
 		os.Remove(dst)
 		return err

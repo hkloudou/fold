@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	_ "github.com/marcboeker/go-duckdb/v2"
 )
 
@@ -19,6 +20,8 @@ func (t *Table[T]) Merge() error {
 	if err := os.MkdirAll(t.mainDir(), 0755); err != nil {
 		return err
 	}
+
+	cleanStaleStaging(t.db.dir)
 
 	incFiles := listParquetFiles(t.incDir())
 	if len(incFiles) == 0 {
@@ -206,7 +209,11 @@ func (t *Table[T]) compactPartition(dir string, collect func() ([]string, error)
 func buildCompactQuery(schema *Schema, incFiles, mainFiles []string, incCols, mainCols map[string]bool) string {
 	pkCols := schema.PKColumns()
 	activeFields := filterActiveFields(schema.Fields, incCols)
-	groupBy := strings.Join(pkCols, ", ")
+	quotedPKs := make([]string, len(pkCols))
+	for i, col := range pkCols {
+		quotedPKs[i] = sqlIdent(col)
+	}
+	groupBy := strings.Join(quotedPKs, ", ")
 
 	sel := groupBy
 	for _, f := range activeFields {
@@ -231,15 +238,15 @@ func buildCompactQuery(schema *Schema, incFiles, mainFiles []string, incCols, ma
 	for _, f := range schema.Fields {
 		switch {
 		case inInc[f.Column] && mainCols[f.Column]:
-			selectExprs = append(selectExprs, f.GetSQLExpr()+" AS "+f.Column)
+			selectExprs = append(selectExprs, f.GetSQLExpr()+" AS "+sqlIdent(f.Column))
 		case inInc[f.Column]:
-			selectExprs = append(selectExprs, "s."+f.Column)
+			selectExprs = append(selectExprs, "s."+sqlIdent(f.Column))
 		case mainCols[f.Column]:
-			selectExprs = append(selectExprs, "t."+f.Column)
+			selectExprs = append(selectExprs, "t."+sqlIdent(f.Column))
 		}
 	}
-	joinConds := make([]string, len(pkCols))
-	for i, col := range pkCols {
+	joinConds := make([]string, len(quotedPKs))
+	for i, col := range quotedPKs {
 		joinConds[i] = fmt.Sprintf("s.%s = t.%s", col, col)
 	}
 
@@ -254,13 +261,13 @@ func buildCompactQuery(schema *Schema, incFiles, mainFiles []string, incCols, ma
 // validation run on the staging file so a failure never publishes over live
 // data.
 func (t *Table[T]) publishCompact(db *sql.DB, dir, query string, consumedInc []string) error {
-	ts := time.Now().UnixMilli()
+	name := segmentFileName(time.Now().UnixMilli())
 	filesDir := filepath.Join(dir, filesSubdir)
 	if err := os.MkdirAll(filesDir, 0755); err != nil {
 		return fmt.Errorf("create files dir: %w", err)
 	}
-	tmpFile := filepath.Join(filesDir, fmt.Sprintf(".merged_%d.parquet.tmp", ts))
-	finalRel := filepath.Join(filesSubdir, fmt.Sprintf("merged_%d.parquet", ts))
+	tmpFile := filepath.Join(filesDir, "."+name+".tmp")
+	finalRel := filepath.Join(filesSubdir, name)
 	finalFile := filepath.Join(dir, finalRel)
 
 	res, err := db.Exec(fmt.Sprintf(`COPY (%s) TO %s (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3)`,
@@ -302,6 +309,16 @@ func (t *Table[T]) publishCompact(db *sql.DB, dir, query string, consumedInc []s
 	}
 
 	return commitActive(t.db.storage, dir, []string{finalRel}, consumedInc)
+}
+
+// segmentFileName names one published segment. The wall clock alone is not a
+// safe name: two publishes on the same partition within one millisecond — or
+// after a clock step backwards — would reuse it, and uploading the new output
+// over the still-active previous file mutates live data outside the manifest
+// commit point. The random suffix makes names collision-free without relying
+// on clock monotonicity.
+func segmentFileName(unixMilli int64) string {
+	return fmt.Sprintf("merged_%d_%s.parquet", unixMilli, uuid.New().String()[:8])
 }
 
 // maybeAddBloom rewrites the staged file with bloom filters unless they are
@@ -466,6 +483,14 @@ func sqlQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
+// sqlIdent double-quotes a column name for interpolation into DuckDB SQL.
+// Column names come from Go field names or column: tag overrides, so a
+// reserved word ("order", "from", "group") or an exotic character would
+// otherwise break the generated statement.
+func sqlIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
 func buildFileList(files []string) string {
 	quoted := make([]string, len(files))
 	for i, f := range files {
@@ -493,6 +518,35 @@ func cleanIncLeftovers(dir string) {
 		return nil
 	})
 	cleanEmptyDirs(dir)
+}
+
+// stagingDirName is the directory under the data root where upsert stages its
+// transient parquet inputs, outside inc/ and main/.
+const stagingDirName = ".staging"
+
+// staleStagingAge is how old an upsert staging directory must be before merge
+// garbage-collects it as a crash leftover. Staging normally lives only for the
+// duration of one upsertRows call and is removed there, crash or not; the
+// generous threshold keeps an unusually slow in-flight compaction's inputs
+// safe. Nothing else covers these directories: they sit outside inc/ and
+// main/, so neither cleanIncLeftovers nor finalizeDir ever sees them.
+const staleStagingAge = 24 * time.Hour
+
+// cleanStaleStaging removes upsert staging directories abandoned by a crash.
+func cleanStaleStaging(dbDir string) {
+	root := filepath.Join(dbDir, stagingDirName)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-staleStagingAge)
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		os.RemoveAll(filepath.Join(root, e.Name()))
+	}
 }
 
 func cleanEmptyDirs(dir string) {

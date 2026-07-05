@@ -35,6 +35,8 @@ func (t *Table[T]) Upsert(source string, records []RawRecord) error {
 		return err
 	}
 
+	cleanStaleStaging(t.db.dir)
+
 	if len(schema.Partitions) > 0 {
 		return t.upsertPartitioned(rows)
 	}
@@ -84,7 +86,7 @@ func (t *Table[T]) upsertPartitioned(rows []map[string]any) error {
 // not recorded as consumed inputs — they are removed here, crash or not, and
 // a crashed upsert is simply retried by the caller.
 func (t *Table[T]) upsertRows(dir string, rows []map[string]any) error {
-	staging := filepath.Join(t.db.dir, ".staging", "upsert_"+uuid.New().String())
+	staging := filepath.Join(t.db.dir, stagingDirName, "upsert_"+uuid.New().String())
 	if err := writeParquet(staging, t.schema, rows); err != nil {
 		os.RemoveAll(staging)
 		return fmt.Errorf("write staging: %w", err)

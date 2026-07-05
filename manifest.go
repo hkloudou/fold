@@ -86,8 +86,12 @@ func readCommit(st Storage, dir, txID string) (*commitRecord, error) {
 	return &c, nil
 }
 
-// writeJSONAtomic writes v as JSON to a temp file then renames it into place. It
-// is the local filesystem's atomic write primitive (see localStorage.WriteJSON).
+// writeJSONAtomic writes v as JSON to a temp file, fsyncs it, then renames it
+// into place. It is the local filesystem's atomic write primitive (see
+// localStorage.WriteJSON). The fsync makes the content durable before the
+// rename can expose it: without it, a power loss can leave a visible but
+// truncated manifest as the partition's commit point — a process crash alone
+// never does, but "crash-safe" should not stop at process crashes.
 func writeJSONAtomic(path string, v any) error {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -97,14 +101,46 @@ func writeJSONAtomic(path string, v any) error {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
 		return err
 	}
+	// Make the rename itself durable before the caller acts on it. This
+	// matters most for the manifest commit: consumed inc files are deleted
+	// right after, and if power loss rolled the rename back afterwards, the
+	// old manifest would resurrect while the data's only other copy (the inc
+	// files) is already gone. Best-effort because directory fsync is
+	// unsupported on some platforms (e.g. Windows); the content fsync above
+	// is the consistency-critical one.
+	syncDir(filepath.Dir(path))
 	return nil
+}
+
+// syncDir best-effort fsyncs a directory so completed renames in it survive
+// power loss. See writeJSONAtomic for why errors are ignored.
+func syncDir(dir string) {
+	if d, err := os.Open(dir); err == nil {
+		d.Sync()
+		d.Close()
+	}
 }
 
 // activeMainFiles returns the absolute paths of a partition's active main files,
