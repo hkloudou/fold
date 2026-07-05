@@ -263,7 +263,10 @@ func buildCompactQuery(schema *Schema, incFiles, mainFiles []string, incCols, ma
 func (t *Table[T]) publishCompact(db *sql.DB, dir, query string, consumedInc []string) error {
 	name := segmentFileName(time.Now().UnixMilli())
 	filesDir := filepath.Join(dir, filesSubdir)
-	if err := os.MkdirAll(filesDir, 0755); err != nil {
+	// Durable up to the partition dir (whose own chain the merge/upsert entry
+	// points already made durable): the files/ dirent must not depend on the
+	// later manifest-write sync for its durability.
+	if err := mkdirAllDurable(filesDir, dir); err != nil {
 		return fmt.Errorf("create files dir: %w", err)
 	}
 	tmpFile := filepath.Join(filesDir, "."+name+".tmp")
