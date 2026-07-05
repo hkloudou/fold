@@ -315,10 +315,11 @@ func (t *Table[T]) publishCompact(db *sql.DB, dir, query string, consumedInc []s
 // safe name: two publishes on the same partition within one millisecond — or
 // after a clock step backwards — would reuse it, and uploading the new output
 // over the still-active previous file mutates live data outside the manifest
-// commit point. The random suffix makes names collision-free without relying
-// on clock monotonicity.
+// commit point. The full 122-bit random UUID makes names collision-free
+// without relying on clock monotonicity (a truncated suffix would reopen a
+// residual collision window).
 func segmentFileName(unixMilli int64) string {
-	return fmt.Sprintf("merged_%d_%s.parquet", unixMilli, uuid.New().String()[:8])
+	return fmt.Sprintf("merged_%d_%s.parquet", unixMilli, uuid.New())
 }
 
 // maybeAddBloom rewrites the staged file with bloom filters unless they are
