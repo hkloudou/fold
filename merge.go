@@ -17,7 +17,7 @@ import (
 
 // Merge performs the CRDT-style merge from inc/ into main/.
 func (t *Table[T]) Merge() error {
-	if err := os.MkdirAll(t.mainDir(), 0755); err != nil {
+	if err := mkdirAllDurable(t.mainDir(), t.db.dir); err != nil {
 		return err
 	}
 
@@ -102,7 +102,7 @@ func runPartitionJobs(name string, workers int, parts []string, fn func(string) 
 // mergeOnePartition merges a single partition.
 func (t *Table[T]) mergeOnePartition(partDir string) error {
 	mainPartDir := filepath.Join(t.mainDir(), partDir)
-	if err := os.MkdirAll(mainPartDir, 0755); err != nil {
+	if err := mkdirAllDurable(mainPartDir, t.db.dir); err != nil {
 		return err
 	}
 	return t.compactPartition(mainPartDir, func() ([]string, error) {

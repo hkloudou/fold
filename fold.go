@@ -116,6 +116,11 @@ func Open(dir string, opts ...Option) (*DB, error) {
 			return nil, fmt.Errorf("fold: create %s directory: %w", sub, err)
 		}
 	}
+	// Make the root layout durable once at open: inc/ and main/ are entries
+	// in dir, and dir itself is an entry in its parent. The publish path
+	// fsyncs everything below this (see mkdirAllDurable).
+	syncDir(dir)
+	syncDir(filepath.Dir(dir))
 	db := &DB{
 		dir:    dir,
 		tables: make(map[string]*Schema),

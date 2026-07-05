@@ -31,7 +31,7 @@ func (t *Table[T]) Upsert(source string, records []RawRecord) error {
 		return nil
 	}
 
-	if err := os.MkdirAll(t.mainDir(), 0755); err != nil {
+	if err := mkdirAllDurable(t.mainDir(), t.db.dir); err != nil {
 		return err
 	}
 
@@ -66,7 +66,7 @@ func (t *Table[T]) upsertPartitioned(rows []map[string]any) error {
 
 	errs := runPartitionJobs(schema.Name, t.db.compact.Workers, parts, func(partDir string) error {
 		mainPartDir := filepath.Join(t.mainDir(), partDir)
-		if err := os.MkdirAll(mainPartDir, 0755); err != nil {
+		if err := mkdirAllDurable(mainPartDir, t.db.dir); err != nil {
 			return err
 		}
 		return t.upsertRows(mainPartDir, groups[partDir])

@@ -143,6 +143,28 @@ func syncDir(dir string) {
 	}
 }
 
+// mkdirAllDurable creates dir (and parents) like os.MkdirAll, then fsyncs the
+// directory chain from dir up to stopAt (inclusive). POSIX makes a created
+// directory durable only once its parent is fsynced, so without this a first
+// publish into a brand-new table/partition directory could commit, delete the
+// consumed inc files, and still lose the whole directory — manifest, segment
+// and all — to a power loss. The publish path calls this before any commit so
+// consumed inc is only ever deleted under a durable directory chain. Directory
+// fsync itself is best-effort (see writeJSONAtomic).
+func mkdirAllDurable(dir, stopAt string) error {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	stopAt = filepath.Clean(stopAt)
+	for d := filepath.Clean(dir); ; d = filepath.Dir(d) {
+		syncDir(d)
+		if d == stopAt || d == filepath.Dir(d) {
+			break
+		}
+	}
+	return nil
+}
+
 // activeMainFiles returns the absolute paths of a partition's active main files,
 // always from the manifest. recoverPartition installs a manifest before any
 // publish, so a directory reaching a publish has one; an output left behind by
